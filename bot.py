@@ -19,6 +19,8 @@ FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY", "")
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Remembers (telegram_id, match_id) pairs already pinged this run, so we don't repeat.
 already_pinged = set()
+# Match IDs that have had a missed-prediction nudge sent this run.
+already_nudged = set()
 
 FLAGS = {
     # South America
@@ -70,6 +72,16 @@ FLAGS = {
 def flag(name: str) -> str:
     """Return 'emoji name' if a flag is known, else just 'name'."""
     return f"{FLAGS[name]} {name}" if name in FLAGS else name
+
+def calc_points(pred_home, pred_away, score_home, score_away) -> int:
+    ph, pa, sh, sa = pred_home, pred_away, score_home, score_away
+    if ph == sh and pa == sa:
+        return 3
+    if (ph > pa) == (sh > sa) and ph != pa:
+        return 1
+    if ph == pa and sh == sa:  # predicted draw, actual draw, wrong score
+        return 1
+    return 0
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -126,13 +138,12 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
 from datetime import datetime, timezone
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+    from datetime import timedelta
     now = datetime.now(timezone.utc)
 
-    # Upcoming matches that haven't kicked off yet.
     matches = db.table("matches").select("*").eq("status", "scheduled").execute().data
-    # Everyone who wants reminders (remind_minutes > 0).
-    users = db.table("users").select("*").gt("remind_minutes", 0).execute().data
-    if not matches or not users:
+    all_users = db.table("users").select("*").execute().data
+    if not matches or not all_users:
         return
 
     for m in matches:
@@ -140,28 +151,43 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             continue
         kickoff = datetime.fromisoformat(m["kickoff_utc"])
         minutes_until = (kickoff - now).total_seconds() / 60
-        if minutes_until <= 0:
-            continue  # already started
+        sgt = kickoff.astimezone(timezone(timedelta(hours=8)))
 
-        for u in users:
-            lead = u["remind_minutes"]
-            key = (u["telegram_id"], m["id"])
-            # Ping if we're now within their lead window and haven't pinged yet.
-            if minutes_until <= lead and key not in already_pinged:
-                already_pinged.add(key)
-                # Convert kickoff to Singapore time for the message.
-                from datetime import timedelta
-                sgt = kickoff.astimezone(timezone(timedelta(hours=8)))
-                try:
-                    await context.bot.send_message(
-                        chat_id=u["telegram_id"],
-                        text=(f"⚽ Kickoff soon!\n"
-                              f"{flag(m['team1'])} v {flag(m['team2'])}\n"
-                              f"{sgt.strftime('%H:%M')} SGT "
-                              f"(in ~{int(minutes_until)} min)")
-                    )
-                except Exception as e:
-                    logging.warning(f"Couldn't message {u['telegram_id']}: {e}")
+        if minutes_until > 0:
+            # Remind users who are within their chosen lead window.
+            for u in all_users:
+                lead = u.get("remind_minutes") or 0
+                if lead <= 0:
+                    continue
+                key = (u["telegram_id"], m["id"])
+                if minutes_until <= lead and key not in already_pinged:
+                    already_pinged.add(key)
+                    try:
+                        await context.bot.send_message(
+                            chat_id=u["telegram_id"],
+                            text=(f"⚽ Kickoff soon!\n"
+                                  f"{flag(m['team1'])} v {flag(m['team2'])}\n"
+                                  f"{sgt.strftime('%H:%M')} SGT "
+                                  f"(in ~{int(minutes_until)} min)")
+                        )
+                    except Exception as e:
+                        logging.warning(f"Couldn't message {u['telegram_id']}: {e}")
+
+        elif minutes_until > -5 and m["id"] not in already_nudged:
+            # Match just kicked off — nudge anyone who skipped it.
+            already_nudged.add(m["id"])
+            preds = db.table("predictions").select("telegram_id").eq("match_id", m["id"]).execute().data
+            predicted_ids = {p["telegram_id"] for p in preds}
+            for u in all_users:
+                if u["telegram_id"] not in predicted_ids:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=u["telegram_id"],
+                            text=(f"⏰ Just kicked off — you missed this one!\n"
+                                  f"{flag(m['team1'])} v {flag(m['team2'])}")
+                        )
+                    except Exception as e:
+                        logging.warning(f"Nudge failed for {u['telegram_id']}: {e}")
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args  # e.g. ["Brazil", "2-1", "Morocco"]
@@ -495,33 +521,21 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     matches = db.table("matches").select("id, score_home, score_away").execute().data
     match_map = {m["id"]: m for m in matches}
 
-    def points(p):
-        m = match_map.get(p["match_id"])
-        if not m:
-            return 0
-        sh, sa = m.get("score_home"), m.get("score_away")
-        if sh is None or sa is None:
-            return 0
-        ph, pa = p["pred_home"], p["pred_away"]
-        if ph == sh and pa == sa:
-            return 3
-        if (ph > pa) == (sh > sa) and ph != pa:  # correct outcome, not a draw mismatch
-            return 1
-        if ph == pa == sh == sa:  # both predicted draw, both drew (covered by exact above)
-            return 3
-        if ph == pa and sh == sa:  # predicted draw, actual draw, wrong score
-            return 1
-        return 0
-
     by_user = defaultdict(list)
     for p in preds:
         by_user[p["telegram_id"]].append(p)
+
+    def score_for(p):
+        m = match_map.get(p["match_id"])
+        if not m or m.get("score_home") is None:
+            return 0
+        return calc_points(p["pred_home"], p["pred_away"], m["score_home"], m["score_away"])
 
     rows = []
     for u in users:
         uid = u["telegram_id"]
         ups = by_user[uid]
-        pts = sum(points(p) for p in ups)
+        pts = sum(score_for(p) for p in ups)
         rows.append((pts, len(ups), u.get("name") or "Anonymous"))
 
     rows.sort(key=lambda x: (-x[0], -x[1]))
@@ -606,6 +620,30 @@ async def poll_results(context: ContextTypes.DEFAULT_TYPE):
                 "status": "finished",
             }).eq("id", match["id"]).execute()
             logging.info(f"Result saved: {match['team1']} {sh}-{sa} {match['team2']}")
+
+            # Broadcast result to everyone who predicted this match.
+            preds = db.table("predictions").select("*").eq("match_id", match["id"]).execute().data
+            for p in preds:
+                pts = calc_points(p["pred_home"], p["pred_away"], sh, sa)
+                if pts == 3:
+                    verdict = "✅ Exact score! *+3 pts*"
+                elif pts == 1:
+                    verdict = "👍 Correct outcome! *+1 pt*"
+                else:
+                    verdict = "❌ Unlucky. +0 pts"
+                try:
+                    await context.bot.send_message(
+                        chat_id=p["telegram_id"],
+                        text=(
+                            f"⚽ Full time!\n"
+                            f"{flag(match['team1'])} {sh}–{sa} {flag(match['team2'])}\n\n"
+                            f"Your prediction: {p['pred_home']}–{p['pred_away']}\n"
+                            f"{verdict}"
+                        ),
+                        parse_mode="Markdown",
+                    )
+                except Exception as e:
+                    logging.warning(f"Broadcast failed for {p['telegram_id']}: {e}")
 
 
 async def set_commands(app):
