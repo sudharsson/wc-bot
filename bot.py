@@ -14,6 +14,8 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY", "")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+TOURNAMENT_WINNER = os.environ.get("TOURNAMENT_WINNER", "")
 
 # One database connection the whole bot shares.
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -90,15 +92,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "name": user.first_name,
     }).execute()
     await update.message.reply_text(
-        f"⚽ Hey {user.first_name}! Welcome to the World Cup prediction game.\n\n"
-        "Here's what I can do:\n"
+        f"⚽ Hey {user.first_name}! Welcome to the World Cup 2026 prediction game.\n\n"
         "/predict – predict a scoreline, e.g. /predict Brazil 2-1 Morocco\n"
-        "/remind – ping me before kickoff, e.g. /remind 30 (or /remind off)\n"
-        "/digest – daily list of upcoming matches, e.g. /digest 20 for 8pm SGT\n"
-        "/ping – check I'm alive\n\n"
-        "/fixtures – see upcoming matches\n"
+        "/winner – pick your tournament winner (+10 bonus pts)\n"
+        "/mypoints – your score and breakdown\n"
+        "/fixtures – upcoming matches\n"
         "/mypredictions – review or cancel your picks\n"
-        "/leaderboard – points standings\n"
+        "/leaderboard – full standings\n"
+        "/remind – kickoff reminders, e.g. /remind 30\n"
+        "/digest – daily match list, e.g. /digest 20 for 8pm SGT\n"
         "/ping – check I'm alive"
     )
 
@@ -512,7 +514,7 @@ async def cancel_pred_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from collections import defaultdict
 
-    users = db.table("users").select("telegram_id, name").execute().data
+    users = db.table("users").select("telegram_id, name, winner_pick").execute().data
     if not users:
         await update.message.reply_text("No players yet!")
         return
@@ -536,20 +538,164 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = u["telegram_id"]
         ups = by_user[uid]
         pts = sum(score_for(p) for p in ups)
-        rows.append((pts, len(ups), u.get("name") or "Anonymous"))
+        winner_bonus = 10 if TOURNAMENT_WINNER and u.get("winner_pick") == TOURNAMENT_WINNER else 0
+        pts += winner_bonus
+        rows.append((pts, len(ups), u.get("name") or "Anonymous", winner_bonus > 0))
 
     rows.sort(key=lambda x: (-x[0], -x[1]))
 
     medals = ["🥇", "🥈", "🥉"]
     lines = ["🏆 *Leaderboard*\n"]
-    for i, (pts, cnt, name) in enumerate(rows[:15]):
+    for i, (pts, cnt, name, has_bonus) in enumerate(rows[:15]):
         rank = medals[i] if i < 3 else f"{i + 1}\\."
-        lines.append(f"{rank} {name}  —  {pts} pts  _({cnt} predictions)_")
+        bonus = " 🏆" if has_bonus else ""
+        lines.append(f"{rank} {name}{bonus}  —  {pts} pts  _({cnt} predictions)_")
 
-    if not any(r[0] > 0 for r in rows):
+    if TOURNAMENT_WINNER:
+        lines.append(f"\n_🏆 = +10 winner bonus ({flag(TOURNAMENT_WINNER)})_")
+    elif not any(r[0] > 0 for r in rows):
         lines.append("\n_Points will appear once match results are in._")
 
     await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    preds = db.table("predictions").select("*").eq("telegram_id", uid).execute().data
+    if not preds:
+        await update.message.reply_text("You haven't made any predictions yet. Use /predict to get started!")
+        return
+
+    match_ids = [p["match_id"] for p in preds]
+    matches = db.table("matches").select("id, score_home, score_away").in_("id", match_ids).execute().data
+    match_map = {m["id"]: m for m in matches}
+
+    total_pts = 0
+    exact = 0
+    correct_outcome = 0
+    pending = 0
+
+    for p in preds:
+        m = match_map.get(p["match_id"])
+        if not m or m.get("score_home") is None:
+            pending += 1
+            continue
+        pts = calc_points(p["pred_home"], p["pred_away"], m["score_home"], m["score_away"])
+        total_pts += pts
+        if pts == 3:
+            exact += 1
+        elif pts == 1:
+            correct_outcome += 1
+
+    settled = len(preds) - pending
+    lines = [
+        "🎯 *Your Score*\n",
+        f"*{total_pts} pts* from {settled} settled prediction{'s' if settled != 1 else ''}",
+    ]
+    if exact:
+        lines.append(f"✅ {exact} exact score{'s' if exact != 1 else ''} (+{exact * 3} pts)")
+    if correct_outcome:
+        lines.append(f"👍 {correct_outcome} correct outcome{'s' if correct_outcome != 1 else ''} (+{correct_outcome} pts)")
+    if pending:
+        lines.append(f"⏳ {pending} result{'s' if pending != 1 else ''} still pending")
+    if settled > 0:
+        hit_rate = round((exact + correct_outcome) / settled * 100)
+        lines.append(f"\n_Hit rate: {hit_rate}% ({exact + correct_outcome}/{settled})_")
+
+    winner_row = db.table("users").select("winner_pick").eq("telegram_id", uid).execute().data
+    winner_pick = winner_row[0].get("winner_pick") if winner_row else None
+    if winner_pick:
+        bonus_note = " — 🏆 +10 pts awarded!" if TOURNAMENT_WINNER and winner_pick == TOURNAMENT_WINNER else ""
+        lines.append(f"\n🏆 Winner pick: {flag(winner_pick)}{bonus_note}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args
+
+    if not args:
+        row = db.table("users").select("winner_pick").eq("telegram_id", user.id).execute().data
+        current = row[0].get("winner_pick") if row else None
+        if current:
+            await update.message.reply_text(
+                f"🏆 Your winner pick: {flag(current)}\n\n"
+                "_To change: /winner <team>_\n"
+                "_To clear: /winner off_",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                "🏆 *Who's winning the World Cup?*\n\n"
+                "Set your pick: `/winner Brazil`\n"
+                "Correct pick at the final = *+10 bonus points!*\n\n"
+                "_Can be changed up until the final kicks off._",
+                parse_mode="Markdown",
+            )
+        return
+
+    if args[0].lower() == "off":
+        db.table("users").update({"winner_pick": None}).eq("telegram_id", user.id).execute()
+        await update.message.reply_text("🏆 Winner pick cleared.")
+        return
+
+    team = " ".join(args)
+    matched = next((t for t in FLAGS if t.lower() == team.lower()), None)
+    if not matched:
+        await update.message.reply_text(
+            f"I don't recognise '{team}'. Check the spelling and try again.\n"
+            "Use /fixtures to see team names."
+        )
+        return
+
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name, "winner_pick": matched}).execute()
+    await update.message.reply_text(
+        f"🏆 Winner pick saved: {flag(matched)}\n\n"
+        "_Correct pick = +10 bonus pts at the final!_",
+        parse_mode="Markdown",
+    )
+
+
+async def _broadcast_match_result(bot, match, sh, sa):
+    """DM every predictor of a match with the result, points, and group stats."""
+    from collections import Counter
+    preds = db.table("predictions").select("*").eq("match_id", match["id"]).execute().data
+    if not preds:
+        return
+
+    total = len(preds)
+    pick_counts = Counter((p["pred_home"], p["pred_away"]) for p in preds)
+    top_pick, top_count = pick_counts.most_common(1)[0]
+    correct = sum(1 for p in preds if calc_points(p["pred_home"], p["pred_away"], sh, sa) > 0)
+    stats_line = (
+        f"\n\n📊 {correct}/{total} predicted correctly"
+        f" · Most picked: {top_pick[0]}–{top_pick[1]} ({top_count})"
+    )
+
+    for p in preds:
+        pts = calc_points(p["pred_home"], p["pred_away"], sh, sa)
+        if pts == 3:
+            verdict = "✅ Exact score! *+3 pts*"
+        elif pts == 1:
+            verdict = "👍 Correct outcome! *+1 pt*"
+        else:
+            verdict = "❌ Unlucky. +0 pts"
+        try:
+            await bot.send_message(
+                chat_id=p["telegram_id"],
+                text=(
+                    f"⚽ Full time!\n"
+                    f"{flag(match['team1'])} {sh}–{sa} {flag(match['team2'])}\n\n"
+                    f"Your prediction: {p['pred_home']}–{p['pred_away']}\n"
+                    f"{verdict}"
+                    f"{stats_line}"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logging.warning(f"Broadcast failed for {p['telegram_id']}: {e}")
 
 
 async def poll_results(context: ContextTypes.DEFAULT_TYPE):
@@ -622,38 +768,72 @@ async def poll_results(context: ContextTypes.DEFAULT_TYPE):
             logging.info(f"Result saved: {match['team1']} {sh}-{sa} {match['team2']}")
 
             # Broadcast result to everyone who predicted this match.
-            preds = db.table("predictions").select("*").eq("match_id", match["id"]).execute().data
-            for p in preds:
-                pts = calc_points(p["pred_home"], p["pred_away"], sh, sa)
-                if pts == 3:
-                    verdict = "✅ Exact score! *+3 pts*"
-                elif pts == 1:
-                    verdict = "👍 Correct outcome! *+1 pt*"
-                else:
-                    verdict = "❌ Unlucky. +0 pts"
-                try:
-                    await context.bot.send_message(
-                        chat_id=p["telegram_id"],
-                        text=(
-                            f"⚽ Full time!\n"
-                            f"{flag(match['team1'])} {sh}–{sa} {flag(match['team2'])}\n\n"
-                            f"Your prediction: {p['pred_home']}–{p['pred_away']}\n"
-                            f"{verdict}"
-                        ),
-                        parse_mode="Markdown",
-                    )
-                except Exception as e:
-                    logging.warning(f"Broadcast failed for {p['telegram_id']}: {e}")
+            await _broadcast_match_result(context.bot, match, sh, sa)
+
+
+async def setresult(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    args = context.args
+    score_idx = next((i for i, a in enumerate(args) if "-" in a and any(c.isdigit() for c in a)), None)
+    if not args or score_idx is None or score_idx == 0 or score_idx == len(args) - 1:
+        await update.message.reply_text("Usage: /setresult Brazil 2-1 Morocco")
+        return
+
+    team1_text = " ".join(args[:score_idx]).strip()
+    team2_text = " ".join(args[score_idx + 1:]).strip()
+    try:
+        sh, sa = [int(x) for x in args[score_idx].split("-")]
+    except ValueError:
+        await update.message.reply_text("Score should look like 2-1.")
+        return
+
+    matches = db.table("matches").select("*").execute().data
+    t1, t2 = team1_text.lower(), team2_text.lower()
+    found = None
+    for m in matches:
+        mt1, mt2 = (m["team1"] or "").lower(), (m["team2"] or "").lower()
+        if (t1 in mt1 and t2 in mt2) or (t1 in mt2 and t2 in mt1):
+            found = m
+            break
+
+    if not found:
+        await update.message.reply_text(f"No match found for {team1_text} v {team2_text}.")
+        return
+
+    if t1 in (found["team1"] or "").lower():
+        final_sh, final_sa = sh, sa
+    else:
+        final_sh, final_sa = sa, sh
+
+    already_finished = found.get("status") == "finished"
+    db.table("matches").update({
+        "score_home": final_sh,
+        "score_away": final_sa,
+        "status": "finished",
+    }).eq("id", found["id"]).execute()
+
+    note = " (score updated — no re-broadcast)" if already_finished else ""
+    await update.message.reply_text(
+        f"✅ Result set: {flag(found['team1'])} {final_sh}–{final_sa} {flag(found['team2'])}{note}"
+    )
+
+    if not already_finished:
+        await _broadcast_match_result(context.bot, found, final_sh, final_sa)
 
 
 async def set_commands(app):
     await app.bot.set_my_commands([
         BotCommand("predict",        "Predict a match scoreline"),
+        BotCommand("mypoints",       "Your score and stats"),
+        BotCommand("winner",         "Pick your tournament winner (+10 pts)"),
         BotCommand("fixtures",       "See upcoming matches"),
-        BotCommand("mypredictions",  "Review your picks"),
+        BotCommand("mypredictions",  "Review or cancel your picks"),
+        BotCommand("leaderboard",    "See the points standings"),
         BotCommand("remind",         "Set kickoff reminders"),
         BotCommand("digest",         "Daily match digest"),
-        BotCommand("leaderboard",    "See the points standings"),
         BotCommand("start",          "Welcome & setup"),
         BotCommand("ping",           "Check the bot is alive"),
     ])
@@ -674,6 +854,9 @@ def main():
     app.add_handler(CommandHandler("mypredictions", mypredictions))
     app.add_handler(CallbackQueryHandler(cancel_pred_cb, pattern=r"^cancel_pred:.+$"))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("mypoints", mypoints))
+    app.add_handler(CommandHandler("winner", winner))
+    app.add_handler(CommandHandler("setresult", setresult))
     print("Bot running. Press Ctrl+C to stop.")
     app.run_polling()
 
