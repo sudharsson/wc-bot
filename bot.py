@@ -4,7 +4,10 @@ import httpx
 from dotenv import load_dotenv
 from supabase import create_client
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes,
+    ConversationHandler, MessageHandler, filters,
+)
 
 load_dotenv()  # read secrets from .env
 
@@ -24,6 +27,7 @@ already_pinged = set()
 # Match IDs that have had a missed-prediction nudge sent this run.
 already_nudged = set()
 _group_chat_id = None  # lazily loaded from settings table
+PICK_MATCH, ENTER_SCORE = range(2)
 
 FLAGS = {
     # South America
@@ -212,41 +216,180 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                         )
                     except Exception as e:
                         logging.warning(f"Nudge failed for {u['telegram_id']}: {e}")
+def _build_predict_keyboard(uid: int, page: int):
+    """Return (text, keyboard) for the match picker, or (None, None) if no matches."""
+    from datetime import datetime, timezone, timedelta
+    sgt = timezone(timedelta(hours=8))
+    now = datetime.now(timezone.utc)
+
+    all_matches = (
+        db.table("matches").select("*").eq("status", "scheduled").order("kickoff_utc").execute().data
+    )
+    upcoming = [
+        m for m in all_matches
+        if m.get("kickoff_utc") and datetime.fromisoformat(m["kickoff_utc"]) > now
+    ]
+    if not upcoming:
+        return None, None
+
+    predicted_ids = {
+        p["match_id"] for p in
+        db.table("predictions").select("match_id").eq("telegram_id", uid).execute().data
+    }
+
+    PAGE_SIZE = 8
+    total = len(upcoming)
+    total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+    start = page * PAGE_SIZE
+    page_matches = upcoming[start: start + PAGE_SIZE]
+
+    buttons = []
+    for m in page_matches:
+        ko = datetime.fromisoformat(m["kickoff_utc"]).astimezone(sgt)
+        mark = "✅" if m["id"] in predicted_ids else "⬜"
+        label = f"{mark}  {flag(m['team1'])} v {flag(m['team2'])}  ·  {ko.strftime('%d %b %H:%M')}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"predict_match:{m['id']}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("← Back", callback_data=f"predict_page:{page - 1}"))
+    if start + PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton("More →", callback_data=f"predict_page:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+
+    text = (
+        f"⚽ *Pick a match to predict*  _(page {page + 1}/{total_pages})_\n"
+        "_✅ = already predicted — tap again to update_"
+    )
+    return text, InlineKeyboardMarkup(buttons)
+
+
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    args = context.args  # e.g. ["Brazil", "2-1", "Morocco"]
+    args = context.args
 
-    if len(args) < 3:
+    # Text-based shortcut: /predict Brazil 2-1 Morocco still works
+    if args:
+        await _predict_from_args(update, context)
+        return ConversationHandler.END
+
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
+    text, keyboard = _build_predict_keyboard(user.id, 0)
+    if not text:
+        await update.message.reply_text("No upcoming matches to predict right now.")
+        return ConversationHandler.END
+
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    return PICK_MATCH
+
+
+async def predict_page_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split(":")[1])
+    text, keyboard = _build_predict_keyboard(query.from_user.id, page)
+    if not text:
+        await query.edit_message_text("No upcoming matches.")
+        return ConversationHandler.END
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    return PICK_MATCH
+
+
+async def predict_pick_match_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    match_id = query.data.split(":", 1)[1]
+
+    row = db.table("matches").select("*").eq("id", match_id).execute().data
+    if not row:
+        await query.edit_message_text("Match not found.")
+        return ConversationHandler.END
+
+    m = row[0]
+    from datetime import datetime, timezone
+    if datetime.now(timezone.utc) >= datetime.fromisoformat(m["kickoff_utc"]):
+        await query.edit_message_text("That match has already kicked off — predictions are closed.")
+        return ConversationHandler.END
+
+    context.user_data["predict_match"] = m
+    await query.edit_message_text(
+        f"⚽ *{flag(m['team1'])} v {flag(m['team2'])}*\n\n"
+        "Enter your score prediction, e.g. `2-1`\n\n"
+        "_/cancel to go back_",
+        parse_mode="Markdown",
+    )
+    return ENTER_SCORE
+
+
+async def predict_enter_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    m = context.user_data.get("predict_match")
+    if not m:
+        await update.message.reply_text("Something went wrong. Try /predict again.")
+        return ConversationHandler.END
+
+    raw = update.message.text.strip().replace(" ", "")
+    parts = raw.split("-", 1)
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
         await update.message.reply_text(
-            "Predict a scoreline like this:\n"
-            "/predict Brazil 2-1 Morocco\n\n"
-            "Format: /predict <team> <home>-<away> <team>"
+            "That doesn't look right — send just the score, e.g. `2-1`.",
+            parse_mode="Markdown",
         )
-        return
+        return ENTER_SCORE  # ask again
 
-    # Find the score token (the one containing '-'), teams are around it.
+    pred_home, pred_away = int(parts[0]), int(parts[1])
+
+    from datetime import datetime, timezone
+    if datetime.now(timezone.utc) >= datetime.fromisoformat(m["kickoff_utc"]):
+        await update.message.reply_text("That match has now started — predictions are closed.")
+        return ConversationHandler.END
+
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
+    db.table("predictions").upsert({
+        "telegram_id": user.id,
+        "match_id": m["id"],
+        "pred_home": pred_home,
+        "pred_away": pred_away,
+    }, on_conflict="telegram_id,match_id").execute()
+
+    await update.message.reply_text(
+        f"✅ Saved: {flag(m['team1'])} {pred_home}–{pred_away} {flag(m['team2'])}\n\n"
+        "_/predict again to make another pick._",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+async def predict_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Cancelled. Use /predict to start again.")
+    return ConversationHandler.END
+
+
+async def _predict_from_args(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the shortcut: /predict Brazil 2-1 Morocco."""
+    user = update.effective_user
+    args = context.args
+
     score_idx = next((i for i, a in enumerate(args) if "-" in a and any(c.isdigit() for c in a)), None)
     if score_idx is None or score_idx == 0 or score_idx == len(args) - 1:
         await update.message.reply_text(
-            "I couldn't find the score. Use: /predict Brazil 2-1 Morocco"
+            "Couldn't parse that. Use `/predict Brazil 2-1 Morocco`\n"
+            "or just `/predict` to pick from a list.",
+            parse_mode="Markdown",
         )
         return
 
     team1_text = " ".join(args[:score_idx]).strip()
     team2_text = " ".join(args[score_idx + 1:]).strip()
-    score = args[score_idx]
-
     try:
-        home_str, away_str = score.split("-")
-        pred_home, pred_away = int(home_str), int(away_str)
+        pred_home, pred_away = [int(x) for x in args[score_idx].split("-")]
     except ValueError:
         await update.message.reply_text("Score should look like 2-1. Try again.")
         return
 
-    # Make sure the user exists in users table.
     db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
 
-    # Find a scheduled match where both typed names appear (case-insensitive).
     matches = db.table("matches").select("*").eq("status", "scheduled").execute().data
     t1, t2 = team1_text.lower(), team2_text.lower()
     found = None
@@ -259,22 +402,19 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not found:
         await update.message.reply_text(
             f"No upcoming match found for {team1_text} v {team2_text}.\n"
-            "Check spelling, or see /fixtures for what's open."
+            "Check spelling, or use /predict to pick from a list."
         )
         return
 
-    # Reject if already kicked off.
     from datetime import datetime, timezone
-    kickoff = datetime.fromisoformat(found["kickoff_utc"])
-    if datetime.now(timezone.utc) >= kickoff:
+    if datetime.now(timezone.utc) >= datetime.fromisoformat(found["kickoff_utc"]):
         await update.message.reply_text("That match has already started — predictions are closed.")
         return
 
-    # Orient the score to the fixture's team order (team1 is home in our table).
     if t1 in (found["team1"] or "").lower():
         h, a = pred_home, pred_away
     else:
-        h, a = pred_away, pred_home  # user typed teams in reverse order
+        h, a = pred_away, pred_home
 
     db.table("predictions").upsert({
         "telegram_id": user.id,
@@ -284,8 +424,8 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }, on_conflict="telegram_id,match_id").execute()
 
     await update.message.reply_text(
-        f"✅ Prediction saved:\n{flag(found['team1'])} {h}–{a} {flag(found['team2'])}\n\n"
-        "_To change it, just /predict the same match again._",
+        f"✅ Saved: {flag(found['team1'])} {h}–{a} {flag(found['team2'])}\n\n"
+        "_/predict again to make another pick._",
         parse_mode="Markdown",
     )
 async def digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1042,10 +1182,26 @@ async def set_commands(app):
 
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(set_commands).build()
+    predict_conv = ConversationHandler(
+        entry_points=[CommandHandler("predict", predict)],
+        states={
+            PICK_MATCH: [
+                CallbackQueryHandler(predict_page_cb, pattern=r"^predict_page:\d+$"),
+                CallbackQueryHandler(predict_pick_match_cb, pattern=r"^predict_match:.+$"),
+            ],
+            ENTER_SCORE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, predict_enter_score),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", predict_cancel)],
+        per_user=True,
+        per_chat=True,
+        allow_reentry=True,
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("remind", remind))
-    app.add_handler(CommandHandler("predict", predict))
+    app.add_handler(predict_conv)
     app.job_queue.run_repeating(check_reminders, interval=60, first=10)
     app.job_queue.run_repeating(send_daily_digest, interval=3600, first=20)
     app.job_queue.run_repeating(poll_results, interval=120, first=30)
