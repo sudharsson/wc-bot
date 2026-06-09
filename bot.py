@@ -20,6 +20,57 @@ db = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Remembers (telegram_id, match_id) pairs already pinged this run, so we don't repeat.
 already_pinged = set()
 
+FLAGS = {
+    # South America
+    "Argentina": "🇦🇷", "Brazil": "🇧🇷", "Uruguay": "🇺🇾", "Colombia": "🇨🇴",
+    "Ecuador": "🇪🇨", "Paraguay": "🇵🇾", "Chile": "🇨🇱", "Peru": "🇵🇪",
+    "Venezuela": "🇻🇪", "Bolivia": "🇧🇴",
+    # North/Central America & Caribbean
+    "USA": "🇺🇸", "United States": "🇺🇸", "Mexico": "🇲🇽", "Canada": "🇨🇦",
+    "Panama": "🇵🇦", "Costa Rica": "🇨🇷", "Honduras": "🇭🇳", "Jamaica": "🇯🇲",
+    "Trinidad and Tobago": "🇹🇹", "El Salvador": "🇸🇻", "Guatemala": "🇬🇹",
+    "Cuba": "🇨🇺", "Haiti": "🇭🇹",
+    # Europe
+    "Germany": "🇩🇪", "France": "🇫🇷", "Spain": "🇪🇸", "England": "🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+    "Portugal": "🇵🇹", "Netherlands": "🇳🇱", "Italy": "🇮🇹", "Belgium": "🇧🇪",
+    "Croatia": "🇭🇷", "Switzerland": "🇨🇭", "Denmark": "🇩🇰", "Austria": "🇦🇹",
+    "Scotland": "🏴󠁧󠁢󠁳󠁣󠁴󠁿", "Turkey": "🇹🇷", "Poland": "🇵🇱", "Serbia": "🇷🇸",
+    "Romania": "🇷🇴", "Slovakia": "🇸🇰", "Hungary": "🇭🇺", "Ukraine": "🇺🇦",
+    "Norway": "🇳🇴", "Greece": "🇬🇷", "Czech Republic": "🇨🇿", "Czechia": "🇨🇿",
+    "Slovenia": "🇸🇮", "Albania": "🇦🇱", "Wales": "🏴󠁧󠁢󠁷󠁬󠁳󠁿", "Sweden": "🇸🇪",
+    "Finland": "🇫🇮", "Bosnia and Herzegovina": "🇧🇦", "Montenegro": "🇲🇪",
+    "North Macedonia": "🇲🇰", "Iceland": "🇮🇸", "Georgia": "🇬🇪",
+    "Luxembourg": "🇱🇺", "Armenia": "🇦🇲", "Estonia": "🇪🇪",
+    "Latvia": "🇱🇻", "Lithuania": "🇱🇹", "Kosovo": "🇽🇰",
+    # Africa
+    "Morocco": "🇲🇦", "Senegal": "🇸🇳", "Cameroon": "🇨🇲", "Nigeria": "🇳🇬",
+    "Ivory Coast": "🇨🇮", "Côte d'Ivoire": "🇨🇮", "Egypt": "🇪🇬",
+    "South Africa": "🇿🇦", "Tunisia": "🇹🇳", "DR Congo": "🇨🇩",
+    "Ghana": "🇬🇭", "Algeria": "🇩🇿", "Mali": "🇲🇱", "Zambia": "🇿🇲",
+    "Uganda": "🇺🇬", "Kenya": "🇰🇪", "Burkina Faso": "🇧🇫", "Guinea": "🇬🇳",
+    "Cape Verde": "🇨🇻", "Angola": "🇦🇴", "Benin": "🇧🇯", "Ethiopia": "🇪🇹",
+    "Mozambique": "🇲🇿", "Tanzania": "🇹🇿", "Rwanda": "🇷🇼", "Comoros": "🇰🇲",
+    "Gabon": "🇬🇦", "Libya": "🇱🇾", "Sudan": "🇸🇩",
+    # Asia
+    "Japan": "🇯🇵", "South Korea": "🇰🇷", "Korea Republic": "🇰🇷",
+    "Iran": "🇮🇷", "Saudi Arabia": "🇸🇦", "Australia": "🇦🇺",
+    "Qatar": "🇶🇦", "Uzbekistan": "🇺🇿", "Jordan": "🇯🇴",
+    "Oman": "🇴🇲", "Iraq": "🇮🇶", "China": "🇨🇳", "China PR": "🇨🇳",
+    "Indonesia": "🇮🇩", "UAE": "🇦🇪", "United Arab Emirates": "🇦🇪",
+    "Thailand": "🇹🇭", "Vietnam": "🇻🇳", "India": "🇮🇳",
+    "Bahrain": "🇧🇭", "Kuwait": "🇰🇼", "Palestine": "🇵🇸",
+    "Syria": "🇸🇾", "Kyrgyzstan": "🇰🇬", "Tajikistan": "🇹🇯",
+    "Philippines": "🇵🇭", "Malaysia": "🇲🇾",
+    # Oceania
+    "New Zealand": "🇳🇿", "Fiji": "🇫🇯", "Vanuatu": "🇻🇺",
+    "Papua New Guinea": "🇵🇬", "Solomon Islands": "🇸🇧",
+    "Tahiti": "🇵🇫", "New Caledonia": "🇳🇨",
+}
+
+def flag(name: str) -> str:
+    """Return 'emoji name' if a flag is known, else just 'name'."""
+    return f"{FLAGS[name]} {name}" if name in FLAGS else name
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.table("users").upsert({
@@ -105,7 +156,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(
                         chat_id=u["telegram_id"],
                         text=(f"⚽ Kickoff soon!\n"
-                              f"{m['team1']} v {m['team2']}\n"
+                              f"{flag(m['team1'])} v {flag(m['team2'])}\n"
                               f"{sgt.strftime('%H:%M')} SGT "
                               f"(in ~{int(minutes_until)} min)")
                     )
@@ -183,7 +234,7 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }, on_conflict="telegram_id,match_id").execute()
 
     await update.message.reply_text(
-        f"✅ Prediction saved:\n{found['team1']} {h}–{a} {found['team2']}\n\n"
+        f"✅ Prediction saved:\n{flag(found['team1'])} {h}–{a} {flag(found['team2'])}\n\n"
         "_To change it, just /predict the same match again._",
         parse_mode="Markdown",
     )
@@ -260,7 +311,7 @@ async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE):
             else:
                 mark = "⬜"
                 unpredicted += 1
-            lines.append(f"{mark} {ko_sgt}  {m['team1']} v {m['team2']}")
+            lines.append(f"{mark} {ko_sgt}  {flag(m['team1'])} v {flag(m['team2'])}")
 
         if unpredicted:
             lines.append(f"\n{unpredicted} still to predict. Use /predict <team> <score> <team>.")
@@ -312,7 +363,7 @@ async def fixtures(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"📅 *Upcoming Fixtures* — page {page}/{total_pages}\n"]
     for m in page_matches:
         ko = datetime.fromisoformat(m["kickoff_utc"]).astimezone(sgt)
-        lines.append(f"{ko.strftime('%a %d %b  %H:%M')} SGT   {m['team1']} v {m['team2']}")
+        lines.append(f"{ko.strftime('%a %d %b  %H:%M')} SGT   {flag(m['team1'])} v {flag(m['team2'])}")
 
     keyboard = None
     if page < total_pages:
@@ -348,7 +399,7 @@ async def fixtures_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"📅 *Upcoming Fixtures* — page {page}/{total_pages}\n"]
     for m in page_matches:
         ko = datetime.fromisoformat(m["kickoff_utc"]).astimezone(sgt)
-        lines.append(f"{ko.strftime('%a %d %b  %H:%M')} SGT   {m['team1']} v {m['team2']}")
+        lines.append(f"{ko.strftime('%a %d %b  %H:%M')} SGT   {flag(m['team1'])} v {flag(m['team2'])}")
 
     keyboard = None
     if page < total_pages:
@@ -389,9 +440,9 @@ async def _predictions_message(telegram_id):
         lines.append("*Upcoming:*")
         for ko, p, m in upcoming:
             ko_str = ko.astimezone(sgt).strftime("%a %d %b %H:%M")
-            lines.append(f"⬜ {m['team1']} {p['pred_home']}–{p['pred_away']} {m['team2']}  _{ko_str} SGT_")
+            lines.append(f"⬜ {flag(m['team1'])} {p['pred_home']}–{p['pred_away']} {flag(m['team2'])}  _{ko_str} SGT_")
             buttons.append([InlineKeyboardButton(
-                f"🗑 Cancel: {m['team1']} v {m['team2']}",
+                f"🗑 Cancel: {flag(m['team1'])} v {flag(m['team2'])}",
                 callback_data=f"cancel_pred:{m['id']}",
             )])
 
@@ -401,7 +452,7 @@ async def _predictions_message(telegram_id):
             ko_str = ko.astimezone(sgt).strftime("%a %d %b")
             sh, sa = m.get("score_home"), m.get("score_away")
             result = f"actual: {sh}–{sa}" if sh is not None and sa is not None else "result pending"
-            lines.append(f"🔒 {m['team1']} {p['pred_home']}–{p['pred_away']} {m['team2']}  _({result})_  _{ko_str}_")
+            lines.append(f"🔒 {flag(m['team1'])} {p['pred_home']}–{p['pred_away']} {flag(m['team2'])}  _({result})_  _{ko_str}_")
 
     if upcoming:
         lines.append("\n_To edit, /predict the same match with a new score._")
@@ -554,7 +605,7 @@ async def poll_results(context: ContextTypes.DEFAULT_TYPE):
                 "score_away": sa,
                 "status": "finished",
             }).eq("id", match["id"]).execute()
-            logging.info(f"Result saved: {match['team1']} {sh}–{sa} {match['team2']}")
+            logging.info(f"Result saved: {match['team1']} {sh}-{sa} {match['team2']}")
 
 
 async def set_commands(app):
