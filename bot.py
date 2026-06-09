@@ -20,18 +20,19 @@ already_pinged = set()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # Make sure this person exists in our users table (so later commands have a row to update).
     db.table("users").upsert({
         "telegram_id": user.id,
         "name": user.first_name,
     }).execute()
     await update.message.reply_text(
-        f"⚽ Hey {user.first_name}! You're set up.\n\n"
-        "Commands coming online:\n"
-        "/ping – check I'm alive\n"
-        "More soon: /remind, /teams, /predict, /leaderboard."
+        f"⚽ Hey {user.first_name}! Welcome to the World Cup prediction game.\n\n"
+        "Here's what I can do:\n"
+        "/predict – predict a scoreline, e.g. /predict Brazil 2-1 Morocco\n"
+        "/remind – ping me before kickoff, e.g. /remind 30 (or /remind off)\n"
+        "/digest – daily list of upcoming matches, e.g. /digest 20 for 8pm SGT\n"
+        "/ping – check I'm alive\n\n"
+        "Coming soon: /fixtures, /mypredictions, /leaderboard."
     )
-
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
@@ -105,13 +106,177 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception as e:
                     logging.warning(f"Couldn't message {u['telegram_id']}: {e}")
+async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args  # e.g. ["Brazil", "2-1", "Morocco"]
 
+    if len(args) < 3:
+        await update.message.reply_text(
+            "Predict a scoreline like this:\n"
+            "/predict Brazil 2-1 Morocco\n\n"
+            "Format: /predict <team> <home>-<away> <team>"
+        )
+        return
+
+    # Find the score token (the one containing '-'), teams are around it.
+    score_idx = next((i for i, a in enumerate(args) if "-" in a and any(c.isdigit() for c in a)), None)
+    if score_idx is None or score_idx == 0 or score_idx == len(args) - 1:
+        await update.message.reply_text(
+            "I couldn't find the score. Use: /predict Brazil 2-1 Morocco"
+        )
+        return
+
+    team1_text = " ".join(args[:score_idx]).strip()
+    team2_text = " ".join(args[score_idx + 1:]).strip()
+    score = args[score_idx]
+
+    try:
+        home_str, away_str = score.split("-")
+        pred_home, pred_away = int(home_str), int(away_str)
+    except ValueError:
+        await update.message.reply_text("Score should look like 2-1. Try again.")
+        return
+
+    # Make sure the user exists in users table.
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
+
+    # Find a scheduled match where both typed names appear (case-insensitive).
+    matches = db.table("matches").select("*").eq("status", "scheduled").execute().data
+    t1, t2 = team1_text.lower(), team2_text.lower()
+    found = None
+    for m in matches:
+        mt1, mt2 = (m["team1"] or "").lower(), (m["team2"] or "").lower()
+        if (t1 in mt1 and t2 in mt2) or (t1 in mt2 and t2 in mt1):
+            found = m
+            break
+
+    if not found:
+        await update.message.reply_text(
+            f"No upcoming match found for {team1_text} v {team2_text}.\n"
+            "Check spelling, or see /fixtures for what's open."
+        )
+        return
+
+    # Reject if already kicked off.
+    from datetime import datetime, timezone
+    kickoff = datetime.fromisoformat(found["kickoff_utc"])
+    if datetime.now(timezone.utc) >= kickoff:
+        await update.message.reply_text("That match has already started — predictions are closed.")
+        return
+
+    # Orient the score to the fixture's team order (team1 is home in our table).
+    if t1 in (found["team1"] or "").lower():
+        h, a = pred_home, pred_away
+    else:
+        h, a = pred_away, pred_home  # user typed teams in reverse order
+
+    db.table("predictions").upsert({
+        "telegram_id": user.id,
+        "match_id": found["id"],
+        "pred_home": h,
+        "pred_away": a,
+    }).execute()
+
+    await update.message.reply_text(
+        f"✅ Prediction saved:\n{found['team1']} {h}-{a} {found['team2']}"
+    )
+async def digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args
+
+    if not args:
+        await update.message.reply_text(
+            "Get a daily list of upcoming matches to predict.\n"
+            "/digest 20  – send it at 8pm SGT (use 24h time, 0–23)\n"
+            "/digest 9   – send it at 9am SGT\n"
+            "/digest off – stop the daily digest"
+        )
+        return
+
+    choice = args[0].lower()
+
+    if choice == "off":
+        db.table("users").upsert({"telegram_id": user.id, "digest_hour": None}).execute()
+        await update.message.reply_text("🔕 Daily digest off.")
+        return
+
+    if not choice.isdigit() or not (0 <= int(choice) <= 23):
+        await update.message.reply_text("Give me an hour 0–23, e.g. /digest 20 for 8pm SGT.")
+        return
+
+    hour = int(choice)
+    db.table("users").upsert({
+        "telegram_id": user.id,
+        "name": user.first_name,
+        "digest_hour": hour,
+    }).execute()
+    # friendly 12h label
+    label = f"{hour % 12 or 12}{'am' if hour < 12 else 'pm'}"
+    await update.message.reply_text(f"📋 Daily digest set for {label} SGT.")
+async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE):
+    from datetime import datetime, timezone, timedelta
+    sgt = timezone(timedelta(hours=8))
+    now_utc = datetime.now(timezone.utc)
+    current_sgt_hour = now_utc.astimezone(sgt).hour
+
+    # Who wants their digest this hour?
+    users = db.table("users").select("*").eq("digest_hour", current_sgt_hour).execute().data
+    if not users:
+        return
+
+    # Matches kicking off in the next 24h.
+    window_end = now_utc + timedelta(hours=24)
+    matches = db.table("matches").select("*").eq("status", "scheduled").execute().data
+    upcoming = []
+    for m in matches:
+        if not m.get("kickoff_utc"):
+            continue
+        ko = datetime.fromisoformat(m["kickoff_utc"])
+        if now_utc < ko <= window_end:
+            upcoming.append((ko, m))
+    upcoming.sort(key=lambda x: x[0])
+
+    if not upcoming:
+        return  # nothing in next 24h, skip everyone
+
+    for u in users:
+        # Which match_ids has this user already predicted?
+        preds = db.table("predictions").select("match_id").eq("telegram_id", u["telegram_id"]).execute().data
+        done = {p["match_id"] for p in preds}
+
+        lines = ["📋 *Next 24 hours* — get your predictions in!\n"]
+        unpredicted = 0
+        for ko, m in upcoming:
+            ko_sgt = ko.astimezone(sgt).strftime("%a %H:%M")
+            if m["id"] in done:
+                mark = "✅"
+            else:
+                mark = "⬜"
+                unpredicted += 1
+            lines.append(f"{mark} {ko_sgt}  {m['team1']} v {m['team2']}")
+
+        if unpredicted:
+            lines.append(f"\n{unpredicted} still to predict. Use /predict <team> <score> <team>.")
+        else:
+            lines.append("\nAll predicted — nice. 👏")
+
+        try:
+            await context.bot.send_message(
+                chat_id=u["telegram_id"],
+                text="\n".join(lines),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logging.warning(f"Digest send failed for {u['telegram_id']}: {e}")
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("remind", remind))
+    app.add_handler(CommandHandler("predict", predict))
     app.job_queue.run_repeating(check_reminders, interval=60, first=10)
+    app.job_queue.run_repeating(send_daily_digest, interval=3600, first=20)
+    app.add_handler(CommandHandler("digest", digest))
     print("Bot running. Press Ctrl+C to stop.")
     app.run_polling()
 
