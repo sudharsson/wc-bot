@@ -2,8 +2,8 @@ import os
 import logging
 from dotenv import load_dotenv
 from supabase import create_client
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 load_dotenv()  # read secrets from .env
 
@@ -31,7 +31,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/remind – ping me before kickoff, e.g. /remind 30 (or /remind off)\n"
         "/digest – daily list of upcoming matches, e.g. /digest 20 for 8pm SGT\n"
         "/ping – check I'm alive\n\n"
-        "Coming soon: /fixtures, /mypredictions, /leaderboard."
+        "/fixtures – see upcoming matches\n"
+        "/mypredictions – review your picks\n\n"
+        "Coming soon: /leaderboard."
     )
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -268,8 +270,155 @@ async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logging.warning(f"Digest send failed for {u['telegram_id']}: {e}")
+async def fixtures(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from datetime import datetime, timezone, timedelta
+    sgt = timezone(timedelta(hours=8))
+    now = datetime.now(timezone.utc)
+
+    args = context.args
+    page = 1
+    if args and args[0].isdigit():
+        page = max(1, int(args[0]))
+
+    PAGE_SIZE = 10
+    all_matches = (
+        db.table("matches")
+        .select("*")
+        .eq("status", "scheduled")
+        .order("kickoff_utc")
+        .execute()
+        .data
+    )
+    upcoming = [m for m in all_matches if m.get("kickoff_utc") and datetime.fromisoformat(m["kickoff_utc"]) > now]
+
+    total = len(upcoming)
+    if not total:
+        await update.message.reply_text("No upcoming fixtures found.")
+        return
+
+    offset = (page - 1) * PAGE_SIZE
+    page_matches = upcoming[offset: offset + PAGE_SIZE]
+    if not page_matches:
+        total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+        await update.message.reply_text(f"Only {total_pages} page(s) available. Try /fixtures 1.")
+        return
+
+    total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+    lines = [f"📅 *Upcoming Fixtures* — page {page}/{total_pages}\n"]
+    for m in page_matches:
+        ko = datetime.fromisoformat(m["kickoff_utc"]).astimezone(sgt)
+        lines.append(f"{ko.strftime('%a %d %b  %H:%M')} SGT   {m['team1']} v {m['team2']}")
+
+    keyboard = None
+    if page < total_pages:
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Next page →", callback_data=f"fixtures:{page + 1}")]])
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def fixtures_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from datetime import datetime, timezone, timedelta
+    sgt = timezone(timedelta(hours=8))
+    now = datetime.now(timezone.utc)
+
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split(":")[1])
+    PAGE_SIZE = 10
+
+    all_matches = (
+        db.table("matches")
+        .select("*")
+        .eq("status", "scheduled")
+        .order("kickoff_utc")
+        .execute()
+        .data
+    )
+    upcoming = [m for m in all_matches if m.get("kickoff_utc") and datetime.fromisoformat(m["kickoff_utc"]) > now]
+
+    total = len(upcoming)
+    total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+    page_matches = upcoming[(page - 1) * PAGE_SIZE: page * PAGE_SIZE]
+
+    lines = [f"📅 *Upcoming Fixtures* — page {page}/{total_pages}\n"]
+    for m in page_matches:
+        ko = datetime.fromisoformat(m["kickoff_utc"]).astimezone(sgt)
+        lines.append(f"{ko.strftime('%a %d %b  %H:%M')} SGT   {m['team1']} v {m['team2']}")
+
+    keyboard = None
+    if page < total_pages:
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Next page →", callback_data=f"fixtures:{page + 1}")]])
+
+    await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def mypredictions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from datetime import datetime, timezone, timedelta
+    sgt = timezone(timedelta(hours=8))
+    now = datetime.now(timezone.utc)
+    user = update.effective_user
+
+    preds = (
+        db.table("predictions")
+        .select("*")
+        .eq("telegram_id", user.id)
+        .execute()
+        .data
+    )
+    if not preds:
+        await update.message.reply_text(
+            "You haven't made any predictions yet.\nUse /predict to get started!"
+        )
+        return
+
+    match_ids = [p["match_id"] for p in preds]
+    matches = db.table("matches").select("*").in_("id", match_ids).execute().data
+    match_map = {m["id"]: m for m in matches}
+
+    upcoming, played = [], []
+    for p in preds:
+        m = match_map.get(p["match_id"])
+        if not m or not m.get("kickoff_utc"):
+            continue
+        ko = datetime.fromisoformat(m["kickoff_utc"])
+        (upcoming if ko > now else played).append((ko, p, m))
+
+    upcoming.sort(key=lambda x: x[0])
+    played.sort(key=lambda x: x[0], reverse=True)
+
+    lines = ["🔮 *Your Predictions*\n"]
+
+    if upcoming:
+        lines.append("*Upcoming:*")
+        for ko, p, m in upcoming:
+            ko_str = ko.astimezone(sgt).strftime("%a %d %b %H:%M")
+            lines.append(f"⬜ {m['team1']} {p['pred_home']}–{p['pred_away']} {m['team2']}  _{ko_str} SGT_")
+
+    if played:
+        lines.append("\n*Played:*")
+        for ko, p, m in played:
+            ko_str = ko.astimezone(sgt).strftime("%a %d %b")
+            sh, sa = m.get("score_home"), m.get("score_away")
+            result = f"actual: {sh}–{sa}" if sh is not None and sa is not None else "result pending"
+            lines.append(f"🔒 {m['team1']} {p['pred_home']}–{p['pred_away']} {m['team2']}  _({result})_  _{ko_str}_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def set_commands(app):
+    await app.bot.set_my_commands([
+        BotCommand("predict",        "Predict a match scoreline"),
+        BotCommand("fixtures",       "See upcoming matches"),
+        BotCommand("mypredictions",  "Review your picks"),
+        BotCommand("remind",         "Set kickoff reminders"),
+        BotCommand("digest",         "Daily match digest"),
+        BotCommand("start",          "Welcome & setup"),
+        BotCommand("ping",           "Check the bot is alive"),
+    ])
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(set_commands).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("remind", remind))
@@ -277,6 +426,9 @@ def main():
     app.job_queue.run_repeating(check_reminders, interval=60, first=10)
     app.job_queue.run_repeating(send_daily_digest, interval=3600, first=20)
     app.add_handler(CommandHandler("digest", digest))
+    app.add_handler(CommandHandler("fixtures", fixtures))
+    app.add_handler(CallbackQueryHandler(fixtures_cb, pattern=r"^fixtures:\d+$"))
+    app.add_handler(CommandHandler("mypredictions", mypredictions))
     print("Bot running. Press Ctrl+C to stop.")
     app.run_polling()
 
