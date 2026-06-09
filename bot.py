@@ -23,6 +23,7 @@ db = create_client(SUPABASE_URL, SUPABASE_KEY)
 already_pinged = set()
 # Match IDs that have had a missed-prediction nudge sent this run.
 already_nudged = set()
+_group_chat_id = None  # lazily loaded from settings table
 
 FLAGS = {
     # South America
@@ -75,6 +76,25 @@ def flag(name: str) -> str:
     """Return 'emoji name' if a flag is known, else just 'name'."""
     return f"{FLAGS[name]} {name}" if name in FLAGS else name
 
+def round_multiplier(round_name: str) -> int:
+    knockout = {"round of 16", "quarter-final", "quarter final", "semi-final", "semi final", "third place", "final"}
+    return 2 if (round_name or "").lower() in knockout else 1
+
+def _load_group_chat_id() -> int:
+    global _group_chat_id
+    if _group_chat_id is None:
+        try:
+            row = db.table("settings").select("value").eq("key", "group_chat_id").execute().data
+            _group_chat_id = int(row[0]["value"]) if row else 0
+        except Exception:
+            _group_chat_id = 0
+    return _group_chat_id
+
+def _save_group_chat_id(chat_id: int):
+    global _group_chat_id
+    _group_chat_id = chat_id
+    db.table("settings").upsert({"key": "group_chat_id", "value": str(chat_id)}).execute()
+
 def calc_points(pred_home, pred_away, score_home, score_away) -> int:
     ph, pa, sh, sa = pred_home, pred_away, score_home, score_away
     if ph == sh and pa == sa:
@@ -94,9 +114,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"⚽ Hey {user.first_name}! Welcome to the World Cup 2026 prediction game.\n\n"
         "/predict – predict a scoreline, e.g. /predict Brazil 2-1 Morocco\n"
+        "/next – see the next 3 upcoming matches\n"
         "/winner – pick your tournament winner (+10 bonus pts)\n"
         "/mypoints – your score and breakdown\n"
-        "/fixtures – upcoming matches\n"
+        "/whopicked – see everyone's pick after kickoff\n"
+        "/fixtures – full fixture list\n"
         "/mypredictions – review or cancel your picks\n"
         "/leaderboard – full standings\n"
         "/remind – kickoff reminders, e.g. /remind 30\n"
@@ -358,6 +380,7 @@ async def fixtures(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from datetime import datetime, timezone, timedelta
     sgt = timezone(timedelta(hours=8))
     now = datetime.now(timezone.utc)
+    uid = update.effective_user.id
 
     args = context.args
     page = 1
@@ -387,11 +410,17 @@ async def fixtures(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Only {total_pages} page(s) available. Try /fixtures 1.")
         return
 
+    predicted_ids = {
+        p["match_id"] for p in
+        db.table("predictions").select("match_id").eq("telegram_id", uid).execute().data
+    }
+
     total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-    lines = [f"📅 *Upcoming Fixtures* — page {page}/{total_pages}\n"]
+    lines = [f"📅 *Upcoming Fixtures* — page {page}/{total_pages}  _(✅ = predicted)_\n"]
     for m in page_matches:
         ko = datetime.fromisoformat(m["kickoff_utc"]).astimezone(sgt)
-        lines.append(f"{ko.strftime('%a %d %b  %H:%M')} SGT   {flag(m['team1'])} v {flag(m['team2'])}")
+        mark = "✅" if m["id"] in predicted_ids else "⬜"
+        lines.append(f"{mark} {ko.strftime('%a %d %b  %H:%M')} SGT   {flag(m['team1'])} v {flag(m['team2'])}")
 
     keyboard = None
     if page < total_pages:
@@ -407,6 +436,7 @@ async def fixtures_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     query = update.callback_query
     await query.answer()
+    uid = query.from_user.id
     page = int(query.data.split(":")[1])
     PAGE_SIZE = 10
 
@@ -420,14 +450,20 @@ async def fixtures_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     upcoming = [m for m in all_matches if m.get("kickoff_utc") and datetime.fromisoformat(m["kickoff_utc"]) > now]
 
+    predicted_ids = {
+        p["match_id"] for p in
+        db.table("predictions").select("match_id").eq("telegram_id", uid).execute().data
+    }
+
     total = len(upcoming)
     total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
     page_matches = upcoming[(page - 1) * PAGE_SIZE: page * PAGE_SIZE]
 
-    lines = [f"📅 *Upcoming Fixtures* — page {page}/{total_pages}\n"]
+    lines = [f"📅 *Upcoming Fixtures* — page {page}/{total_pages}  _(✅ = predicted)_\n"]
     for m in page_matches:
         ko = datetime.fromisoformat(m["kickoff_utc"]).astimezone(sgt)
-        lines.append(f"{ko.strftime('%a %d %b  %H:%M')} SGT   {flag(m['team1'])} v {flag(m['team2'])}")
+        mark = "✅" if m["id"] in predicted_ids else "⬜"
+        lines.append(f"{mark} {ko.strftime('%a %d %b  %H:%M')} SGT   {flag(m['team1'])} v {flag(m['team2'])}")
 
     keyboard = None
     if page < total_pages:
@@ -479,7 +515,11 @@ async def _predictions_message(telegram_id):
         for ko, p, m in played:
             ko_str = ko.astimezone(sgt).strftime("%a %d %b")
             sh, sa = m.get("score_home"), m.get("score_away")
-            result = f"actual: {sh}–{sa}" if sh is not None and sa is not None else "result pending"
+            if sh is not None and sa is not None:
+                pts = calc_points(p["pred_home"], p["pred_away"], sh, sa) * round_multiplier(m.get("round", ""))
+                result = f"{sh}–{sa}, +{pts}pts"
+            else:
+                result = "result pending"
             lines.append(f"🔒 {flag(m['team1'])} {p['pred_home']}–{p['pred_away']} {flag(m['team2'])}  _({result})_  _{ko_str}_")
 
     if upcoming:
@@ -520,7 +560,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     preds = db.table("predictions").select("*").execute().data
-    matches = db.table("matches").select("id, score_home, score_away").execute().data
+    matches = db.table("matches").select("id, score_home, score_away, round").execute().data
     match_map = {m["id"]: m for m in matches}
 
     by_user = defaultdict(list)
@@ -531,7 +571,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m = match_map.get(p["match_id"])
         if not m or m.get("score_home") is None:
             return 0
-        return calc_points(p["pred_home"], p["pred_away"], m["score_home"], m["score_away"])
+        return calc_points(p["pred_home"], p["pred_away"], m["score_home"], m["score_away"]) * round_multiplier(m.get("round", ""))
 
     rows = []
     for u in users:
@@ -568,12 +608,14 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     match_ids = [p["match_id"] for p in preds]
-    matches = db.table("matches").select("id, score_home, score_away").in_("id", match_ids).execute().data
+    matches = db.table("matches").select("id, score_home, score_away, round").in_("id", match_ids).execute().data
     match_map = {m["id"]: m for m in matches}
 
     total_pts = 0
     exact = 0
+    exact_pts = 0
     correct_outcome = 0
+    outcome_pts = 0
     pending = 0
 
     for p in preds:
@@ -581,12 +623,14 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not m or m.get("score_home") is None:
             pending += 1
             continue
-        pts = calc_points(p["pred_home"], p["pred_away"], m["score_home"], m["score_away"])
+        pts = calc_points(p["pred_home"], p["pred_away"], m["score_home"], m["score_away"]) * round_multiplier(m.get("round", ""))
         total_pts += pts
-        if pts == 3:
+        if pts >= 3:
             exact += 1
-        elif pts == 1:
+            exact_pts += pts
+        elif pts > 0:
             correct_outcome += 1
+            outcome_pts += pts
 
     settled = len(preds) - pending
     lines = [
@@ -594,9 +638,9 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"*{total_pts} pts* from {settled} settled prediction{'s' if settled != 1 else ''}",
     ]
     if exact:
-        lines.append(f"✅ {exact} exact score{'s' if exact != 1 else ''} (+{exact * 3} pts)")
+        lines.append(f"✅ {exact} exact score{'s' if exact != 1 else ''} (+{exact_pts} pts)")
     if correct_outcome:
-        lines.append(f"👍 {correct_outcome} correct outcome{'s' if correct_outcome != 1 else ''} (+{correct_outcome} pts)")
+        lines.append(f"👍 {correct_outcome} correct outcome{'s' if correct_outcome != 1 else ''} (+{outcome_pts} pts)")
     if pending:
         lines.append(f"⏳ {pending} result{'s' if pending != 1 else ''} still pending")
     if settled > 0:
@@ -659,12 +703,14 @@ async def winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _broadcast_match_result(bot, match, sh, sa):
-    """DM every predictor of a match with the result, points, and group stats."""
-    from collections import Counter
+    """DM every predictor with result, points, streak, and group stats. Also posts to group chat."""
+    from collections import Counter, defaultdict
+
     preds = db.table("predictions").select("*").eq("match_id", match["id"]).execute().data
     if not preds:
         return
 
+    mult = round_multiplier(match.get("round", ""))
     total = len(preds)
     pick_counts = Counter((p["pred_home"], p["pred_away"]) for p in preds)
     top_pick, top_count = pick_counts.most_common(1)[0]
@@ -674,14 +720,45 @@ async def _broadcast_match_result(bot, match, sh, sa):
         f" · Most picked: {top_pick[0]}–{top_pick[1]} ({top_count})"
     )
 
+    # Batch-load all predictions + match results for streak computation
+    all_predictor_ids = [p["telegram_id"] for p in preds]
+    all_preds = db.table("predictions").select("*").in_("telegram_id", all_predictor_ids).execute().data
+    all_match_ids = list({p["match_id"] for p in all_preds})
+    streak_matches = db.table("matches").select("id, kickoff_utc, score_home, score_away").in_("id", all_match_ids).execute().data
+    streak_match_map = {m["id"]: m for m in streak_matches}
+    preds_by_user = defaultdict(list)
+    for p in all_preds:
+        preds_by_user[p["telegram_id"]].append(p)
+
+    def compute_streak(uid):
+        results = []
+        for p in preds_by_user[uid]:
+            m = streak_match_map.get(p["match_id"])
+            if not m or m.get("score_home") is None:
+                continue
+            pts = calc_points(p["pred_home"], p["pred_away"], m["score_home"], m["score_away"])
+            results.append((m.get("kickoff_utc", ""), pts > 0))
+        results.sort(key=lambda x: x[0])
+        streak = 0
+        for _, correct_pred in reversed(results):
+            if correct_pred:
+                streak += 1
+            else:
+                break
+        return streak
+
     for p in preds:
-        pts = calc_points(p["pred_home"], p["pred_away"], sh, sa)
-        if pts == 3:
-            verdict = "✅ Exact score! *+3 pts*"
-        elif pts == 1:
-            verdict = "👍 Correct outcome! *+1 pt*"
+        pts = calc_points(p["pred_home"], p["pred_away"], sh, sa) * mult
+        if pts >= 3:
+            verdict = f"✅ Exact score! *+{pts} pts*"
+        elif pts > 0:
+            verdict = f"👍 Correct outcome! *+{pts} pt{'s' if pts > 1 else ''}*"
         else:
             verdict = "❌ Unlucky. +0 pts"
+
+        streak = compute_streak(p["telegram_id"])
+        streak_line = f"\n🔥 {streak} correct in a row!" if streak >= 3 else (f"\n🔥 {streak} in a row!" if streak == 2 else "")
+
         try:
             await bot.send_message(
                 chat_id=p["telegram_id"],
@@ -690,12 +767,30 @@ async def _broadcast_match_result(bot, match, sh, sa):
                     f"{flag(match['team1'])} {sh}–{sa} {flag(match['team2'])}\n\n"
                     f"Your prediction: {p['pred_home']}–{p['pred_away']}\n"
                     f"{verdict}"
+                    f"{streak_line}"
                     f"{stats_line}"
                 ),
                 parse_mode="Markdown",
             )
         except Exception as e:
             logging.warning(f"Broadcast failed for {p['telegram_id']}: {e}")
+
+    # Post summary to group chat if one is configured
+    gcid = _load_group_chat_id()
+    if gcid:
+        try:
+            await bot.send_message(
+                chat_id=gcid,
+                text=(
+                    f"⚽ *Full time!*\n"
+                    f"{flag(match['team1'])} {sh}–{sa} {flag(match['team2'])}\n\n"
+                    f"📊 {correct}/{total} predicted correctly"
+                    f" · Most picked: {top_pick[0]}–{top_pick[1]} ({top_count})"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logging.warning(f"Group broadcast failed: {e}")
 
 
 async def poll_results(context: ContextTypes.DEFAULT_TYPE):
@@ -824,12 +919,118 @@ async def setresult(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _broadcast_match_result(context.bot, found, final_sh, final_sa)
 
 
+async def next_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from datetime import datetime, timezone, timedelta
+    sgt = timezone(timedelta(hours=8))
+    now = datetime.now(timezone.utc)
+    uid = update.effective_user.id
+
+    all_matches = (
+        db.table("matches").select("*").eq("status", "scheduled").order("kickoff_utc").execute().data
+    )
+    upcoming = [m for m in all_matches if m.get("kickoff_utc") and datetime.fromisoformat(m["kickoff_utc"]) > now]
+
+    if not upcoming:
+        await update.message.reply_text("No upcoming matches.")
+        return
+
+    predicted_ids = {
+        p["match_id"] for p in
+        db.table("predictions").select("match_id").eq("telegram_id", uid).execute().data
+    }
+
+    lines = ["🗓 *Next up:*\n"]
+    for m in upcoming[:3]:
+        ko = datetime.fromisoformat(m["kickoff_utc"]).astimezone(sgt)
+        mark = "✅" if m["id"] in predicted_ids else "⬜"
+        lines.append(f"{mark} {ko.strftime('%a %d %b  %H:%M')} SGT   {flag(m['team1'])} v {flag(m['team2'])}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def whopicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from datetime import datetime, timezone, timedelta
+    args = context.args
+
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /whopicked Brazil Morocco")
+        return
+
+    # Parse team names (ignore any score token if present)
+    score_idx = next((i for i, a in enumerate(args) if "-" in a and any(c.isdigit() for c in a)), None)
+    if score_idx is not None:
+        team1_text = " ".join(args[:score_idx]).strip()
+        team2_text = " ".join(args[score_idx + 1:]).strip()
+    else:
+        team1_text = args[0]
+        team2_text = " ".join(args[1:])
+
+    matches = db.table("matches").select("*").execute().data
+    t1, t2 = team1_text.lower(), team2_text.lower()
+    found = None
+    for m in matches:
+        mt1, mt2 = (m["team1"] or "").lower(), (m["team2"] or "").lower()
+        if (t1 in mt1 and t2 in mt2) or (t1 in mt2 and t2 in mt1):
+            found = m
+            break
+
+    if not found:
+        await update.message.reply_text(f"No match found for {team1_text} v {team2_text}.")
+        return
+
+    kickoff = datetime.fromisoformat(found["kickoff_utc"])
+    if datetime.now(timezone.utc) < kickoff:
+        sgt = timezone(timedelta(hours=8))
+        ko_sgt = kickoff.astimezone(sgt).strftime("%a %d %b %H:%M")
+        await update.message.reply_text(
+            f"Picks for {flag(found['team1'])} v {flag(found['team2'])} are hidden until kickoff ({ko_sgt} SGT)."
+        )
+        return
+
+    preds = db.table("predictions").select("*").eq("match_id", found["id"]).execute().data
+    if not preds:
+        await update.message.reply_text(f"Nobody predicted {flag(found['team1'])} v {flag(found['team2'])}.")
+        return
+
+    users = db.table("users").select("telegram_id, name").execute().data
+    user_names = {u["telegram_id"]: u.get("name") or "Anonymous" for u in users}
+
+    sh, sa = found.get("score_home"), found.get("score_away")
+    lines = [f"🔮 *{flag(found['team1'])} v {flag(found['team2'])}*\n"]
+    for p in sorted(preds, key=lambda x: (x["pred_home"], x["pred_away"])):
+        name = user_names.get(p["telegram_id"], "Anonymous")
+        score_str = f"{p['pred_home']}–{p['pred_away']}"
+        if sh is not None and sa is not None:
+            pts = calc_points(p["pred_home"], p["pred_away"], sh, sa) * round_multiplier(found.get("round", ""))
+            pts_tag = f"  ✅ +{pts}pts" if pts > 0 else "  ❌"
+        else:
+            pts_tag = ""
+        lines.append(f"{name}: {score_str}{pts_tag}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    chat_id = update.effective_chat.id
+    _save_group_chat_id(chat_id)
+    await update.message.reply_text(
+        f"✅ Group channel set to this chat (ID: `{chat_id}`).\n"
+        "Match results will now be posted here.",
+        parse_mode="Markdown",
+    )
+
+
 async def set_commands(app):
     await app.bot.set_my_commands([
         BotCommand("predict",        "Predict a match scoreline"),
+        BotCommand("next",           "See the next 3 upcoming matches"),
         BotCommand("mypoints",       "Your score and stats"),
         BotCommand("winner",         "Pick your tournament winner (+10 pts)"),
-        BotCommand("fixtures",       "See upcoming matches"),
+        BotCommand("whopicked",      "See everyone's pick for a match"),
+        BotCommand("fixtures",       "Full fixture list"),
         BotCommand("mypredictions",  "Review or cancel your picks"),
         BotCommand("leaderboard",    "See the points standings"),
         BotCommand("remind",         "Set kickoff reminders"),
@@ -857,6 +1058,9 @@ def main():
     app.add_handler(CommandHandler("mypoints", mypoints))
     app.add_handler(CommandHandler("winner", winner))
     app.add_handler(CommandHandler("setresult", setresult))
+    app.add_handler(CommandHandler("next", next_matches))
+    app.add_handler(CommandHandler("whopicked", whopicked))
+    app.add_handler(CommandHandler("setgroup", setgroup))
     print("Bot running. Press Ctrl+C to stop.")
     app.run_polling()
 
