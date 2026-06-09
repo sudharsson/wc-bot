@@ -1,5 +1,6 @@
 import os
 import logging
+import httpx
 from dotenv import load_dotenv
 from supabase import create_client
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
@@ -12,6 +13,7 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY", "")
 
 # One database connection the whole bot shares.
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -485,6 +487,76 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
 
 
+async def poll_results(context: ContextTypes.DEFAULT_TYPE):
+    """Fetch finished WC match results from api-football and update Supabase."""
+    if not FOOTBALL_API_KEY:
+        return
+
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(minutes=105)).isoformat()
+
+    pending = (
+        db.table("matches")
+        .select("*")
+        .eq("status", "scheduled")
+        .lt("kickoff_utc", cutoff)
+        .execute()
+        .data
+    )
+    if not pending:
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://v3.football.api-sports.io/fixtures",
+                headers={"x-apisports-key": FOOTBALL_API_KEY},
+                params={"league": 1, "season": 2026, "status": "FT"},
+            )
+    except Exception as e:
+        logging.warning(f"poll_results request failed: {e}")
+        return
+
+    if resp.status_code != 200:
+        logging.warning(f"poll_results: API returned {resp.status_code}")
+        return
+
+    api_fixtures = resp.json().get("response", [])
+    if not api_fixtures:
+        return
+
+    # Build lookup: (home_name_lower, away_name_lower) -> (score_home, score_away)
+    api_lookup = {}
+    for f in api_fixtures:
+        home = f["teams"]["home"]["name"].lower()
+        away = f["teams"]["away"]["name"].lower()
+        goals = f["goals"]
+        if goals["home"] is not None and goals["away"] is not None:
+            api_lookup[(home, away)] = (int(goals["home"]), int(goals["away"]))
+
+    for match in pending:
+        t1 = (match["team1"] or "").lower()
+        t2 = (match["team2"] or "").lower()
+
+        # Exact match first, then partial (handles name differences like "Korea Republic" vs "South Korea")
+        result = api_lookup.get((t1, t2))
+        if not result:
+            for (ah, aa), scores in api_lookup.items():
+                if (t1 in ah or ah in t1) and (t2 in aa or aa in t2):
+                    result = scores
+                    break
+
+        if result:
+            sh, sa = result
+            db.table("matches").update({
+                "score_home": sh,
+                "score_away": sa,
+                "status": "finished",
+            }).eq("id", match["id"]).execute()
+            logging.info(f"Result saved: {match['team1']} {sh}–{sa} {match['team2']}")
+
+
 async def set_commands(app):
     await app.bot.set_my_commands([
         BotCommand("predict",        "Predict a match scoreline"),
@@ -506,6 +578,7 @@ def main():
     app.add_handler(CommandHandler("predict", predict))
     app.job_queue.run_repeating(check_reminders, interval=60, first=10)
     app.job_queue.run_repeating(send_daily_digest, interval=3600, first=20)
+    app.job_queue.run_repeating(poll_results, interval=120, first=30)
     app.add_handler(CommandHandler("digest", digest))
     app.add_handler(CommandHandler("fixtures", fixtures))
     app.add_handler(CallbackQueryHandler(fixtures_cb, pattern=r"^fixtures:\d+$"))
