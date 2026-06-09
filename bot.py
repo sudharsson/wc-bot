@@ -32,8 +32,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/digest – daily list of upcoming matches, e.g. /digest 20 for 8pm SGT\n"
         "/ping – check I'm alive\n\n"
         "/fixtures – see upcoming matches\n"
-        "/mypredictions – review your picks\n\n"
-        "Coming soon: /leaderboard."
+        "/mypredictions – review or cancel your picks\n"
+        "/leaderboard – points standings\n"
+        "/ping – check I'm alive"
     )
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -177,10 +178,12 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "match_id": found["id"],
         "pred_home": h,
         "pred_away": a,
-    }).execute()
+    }, on_conflict="telegram_id,match_id").execute()
 
     await update.message.reply_text(
-        f"✅ Prediction saved:\n{found['team1']} {h}-{a} {found['team2']}"
+        f"✅ Prediction saved:\n{found['team1']} {h}–{a} {found['team2']}\n\n"
+        "_To change it, just /predict the same match again._",
+        parse_mode="Markdown",
     )
 async def digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -352,24 +355,15 @@ async def fixtures_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=keyboard)
 
 
-async def mypredictions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _predictions_message(telegram_id):
+    """Build (text, reply_markup) for a user's predictions list."""
     from datetime import datetime, timezone, timedelta
     sgt = timezone(timedelta(hours=8))
     now = datetime.now(timezone.utc)
-    user = update.effective_user
 
-    preds = (
-        db.table("predictions")
-        .select("*")
-        .eq("telegram_id", user.id)
-        .execute()
-        .data
-    )
+    preds = db.table("predictions").select("*").eq("telegram_id", telegram_id).execute().data
     if not preds:
-        await update.message.reply_text(
-            "You haven't made any predictions yet.\nUse /predict to get started!"
-        )
-        return
+        return "You haven't made any predictions yet.\nUse /predict to get started!", None
 
     match_ids = [p["match_id"] for p in preds]
     matches = db.table("matches").select("*").in_("id", match_ids).execute().data
@@ -387,12 +381,17 @@ async def mypredictions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     played.sort(key=lambda x: x[0], reverse=True)
 
     lines = ["🔮 *Your Predictions*\n"]
+    buttons = []
 
     if upcoming:
         lines.append("*Upcoming:*")
         for ko, p, m in upcoming:
             ko_str = ko.astimezone(sgt).strftime("%a %d %b %H:%M")
             lines.append(f"⬜ {m['team1']} {p['pred_home']}–{p['pred_away']} {m['team2']}  _{ko_str} SGT_")
+            buttons.append([InlineKeyboardButton(
+                f"🗑 Cancel: {m['team1']} v {m['team2']}",
+                callback_data=f"cancel_pred:{m['id']}",
+            )])
 
     if played:
         lines.append("\n*Played:*")
@@ -402,7 +401,88 @@ async def mypredictions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = f"actual: {sh}–{sa}" if sh is not None and sa is not None else "result pending"
             lines.append(f"🔒 {m['team1']} {p['pred_home']}–{p['pred_away']} {m['team2']}  _({result})_  _{ko_str}_")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    if upcoming:
+        lines.append("\n_To edit, /predict the same match with a new score._")
+
+    return "\n".join(lines), InlineKeyboardMarkup(buttons) if buttons else None
+
+
+async def mypredictions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, markup = await _predictions_message(update.effective_user.id)
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+
+
+async def cancel_pred_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from datetime import datetime, timezone
+    query = update.callback_query
+    match_id = query.data.split(":", 1)[1]
+    telegram_id = query.from_user.id
+
+    row = db.table("matches").select("kickoff_utc").eq("id", match_id).execute().data
+    if row and row[0].get("kickoff_utc"):
+        if datetime.now(timezone.utc) >= datetime.fromisoformat(row[0]["kickoff_utc"]):
+            await query.answer("Match already started — can't cancel.", show_alert=True)
+            return
+
+    db.table("predictions").delete().eq("telegram_id", telegram_id).eq("match_id", match_id).execute()
+    await query.answer("Prediction cancelled.")
+    text, markup = await _predictions_message(telegram_id)
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+
+
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from collections import defaultdict
+
+    users = db.table("users").select("telegram_id, name").execute().data
+    if not users:
+        await update.message.reply_text("No players yet!")
+        return
+
+    preds = db.table("predictions").select("*").execute().data
+    matches = db.table("matches").select("id, score_home, score_away").execute().data
+    match_map = {m["id"]: m for m in matches}
+
+    def points(p):
+        m = match_map.get(p["match_id"])
+        if not m:
+            return 0
+        sh, sa = m.get("score_home"), m.get("score_away")
+        if sh is None or sa is None:
+            return 0
+        ph, pa = p["pred_home"], p["pred_away"]
+        if ph == sh and pa == sa:
+            return 3
+        if (ph > pa) == (sh > sa) and ph != pa:  # correct outcome, not a draw mismatch
+            return 1
+        if ph == pa == sh == sa:  # both predicted draw, both drew (covered by exact above)
+            return 3
+        if ph == pa and sh == sa:  # predicted draw, actual draw, wrong score
+            return 1
+        return 0
+
+    by_user = defaultdict(list)
+    for p in preds:
+        by_user[p["telegram_id"]].append(p)
+
+    rows = []
+    for u in users:
+        uid = u["telegram_id"]
+        ups = by_user[uid]
+        pts = sum(points(p) for p in ups)
+        rows.append((pts, len(ups), u.get("name") or "Anonymous"))
+
+    rows.sort(key=lambda x: (-x[0], -x[1]))
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 *Leaderboard*\n"]
+    for i, (pts, cnt, name) in enumerate(rows[:15]):
+        rank = medals[i] if i < 3 else f"{i + 1}\\."
+        lines.append(f"{rank} {name}  —  {pts} pts  _({cnt} predictions)_")
+
+    if not any(r[0] > 0 for r in rows):
+        lines.append("\n_Points will appear once match results are in._")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
 
 
 async def set_commands(app):
@@ -412,6 +492,7 @@ async def set_commands(app):
         BotCommand("mypredictions",  "Review your picks"),
         BotCommand("remind",         "Set kickoff reminders"),
         BotCommand("digest",         "Daily match digest"),
+        BotCommand("leaderboard",    "See the points standings"),
         BotCommand("start",          "Welcome & setup"),
         BotCommand("ping",           "Check the bot is alive"),
     ])
@@ -429,6 +510,8 @@ def main():
     app.add_handler(CommandHandler("fixtures", fixtures))
     app.add_handler(CallbackQueryHandler(fixtures_cb, pattern=r"^fixtures:\d+$"))
     app.add_handler(CommandHandler("mypredictions", mypredictions))
+    app.add_handler(CallbackQueryHandler(cancel_pred_cb, pattern=r"^cancel_pred:.+$"))
+    app.add_handler(CommandHandler("leaderboard", leaderboard))
     print("Bot running. Press Ctrl+C to stop.")
     app.run_polling()
 
