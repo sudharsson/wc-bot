@@ -150,22 +150,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "name": user.first_name,
     }).execute()
     await update.message.reply_text(
-        f"⚽ Hey {user.first_name}! Welcome to the World Cup 2026 prediction game.\n\n"
-        "/predict – predict a scoreline\n"
-        "/next – next 3 upcoming matches\n"
-        "/winner – pick your tournament winner (+10 bonus pts)\n"
-        "/mypoints – your score and breakdown\n"
-        "/leaderboard – your league standings\n"
-        "/masterleaderboard – everyone across all leagues\n"
-        "/createleague – start a private league with friends\n"
-        "/joinleague – join a league with a code\n"
-        "/myleague – see your leagues and share codes\n"
-        "/whopicked – see everyone's pick after kickoff\n"
-        "/fixtures – full fixture list\n"
-        "/mypredictions – review or cancel your picks\n"
-        "/remind – kickoff reminders, e.g. /remind 30\n"
-        "/digest – daily match digest\n"
-        "/ping – check I'm alive"
+        f"⚽ *Hey {user.first_name}! Welcome to the World Cup 2026 Prediction Game.*\n\n"
+        "Predict the scoreline of every match, earn points, and beat your mates to the top of the leaderboard.\n\n"
+        "🎯 *How points work:*\n"
+        "• Exact scoreline → *3 pts*\n"
+        "• Correct outcome (win or draw) → *1 pt*\n"
+        "• Knockout rounds → points are *doubled*\n"
+        "• Pick the tournament winner → *+10 bonus pts*\n\n"
+        "🚀 *Get started in 3 steps:*\n"
+        "1️⃣ /predict — pick your first match scoreline\n"
+        "2️⃣ /winner — choose who lifts the trophy\n"
+        "3️⃣ /createleague MyLeagueName — create a private league and share the join code with friends\n"
+        "   (or /joinleague CODE if a friend already made one)\n\n"
+        "📋 *All commands:*\n"
+        "/mypoints — your score, rank & stats\n"
+        "/leaderboard — your league standings\n"
+        "/masterleaderboard — everyone across all leagues\n"
+        "/next — next 3 upcoming matches\n"
+        "/fixtures — full fixture list\n"
+        "/mypredictions — review or cancel your picks\n"
+        "/whopicked — see everyone's pick after kickoff\n"
+        "/myleague — your leagues and share codes\n"
+        "/remind 30 — reminder 30 min before kickoff\n"
+        "/digest 20 — daily digest at 8pm SGT\n\n"
+        "_Predictions lock the moment a match kicks off. Good luck!_ 🍀",
+        parse_mode="Markdown",
     )
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -782,6 +791,7 @@ async def leaderboard_league_cb(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from collections import defaultdict
     uid = update.effective_user.id
 
     preds = db.table("predictions").select("*").eq("telegram_id", uid).execute().data
@@ -814,10 +824,42 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
             correct_outcome += 1
             outcome_pts += pts
 
+    winner_row = db.table("users").select("winner_pick").eq("telegram_id", uid).execute().data
+    winner_pick = winner_row[0].get("winner_pick") if winner_row else None
+    winner_bonus = 10 if TOURNAMENT_WINNER and winner_pick == TOURNAMENT_WINNER else 0
+    total_pts += winner_bonus
+
+    # Compute rank across all players
+    all_users = db.table("users").select("telegram_id, winner_pick").execute().data
+    all_preds = db.table("predictions").select("*").execute().data
+    all_matches_data = db.table("matches").select("id, score_home, score_away, round").execute().data
+    all_match_map = {m["id"]: m for m in all_matches_data}
+    preds_by_user = defaultdict(list)
+    for p in all_preds:
+        preds_by_user[p["telegram_id"]].append(p)
+
+    def user_total(u):
+        s = sum(
+            calc_points(p["pred_home"], p["pred_away"],
+                        all_match_map[p["match_id"]]["score_home"],
+                        all_match_map[p["match_id"]]["score_away"]) *
+            round_multiplier(all_match_map[p["match_id"]].get("round", ""))
+            for p in preds_by_user[u["telegram_id"]]
+            if p["match_id"] in all_match_map and all_match_map[p["match_id"]].get("score_home") is not None
+        )
+        if TOURNAMENT_WINNER and u.get("winner_pick") == TOURNAMENT_WINNER:
+            s += 10
+        return s
+
+    all_scores = sorted([user_total(u) for u in all_users], reverse=True)
+    rank = next((i + 1 for i, s in enumerate(all_scores) if s <= total_pts), len(all_scores))
+    total_players = len(all_users)
+
     settled = len(preds) - pending
     lines = [
         "🎯 *Your Score*\n",
-        f"*{total_pts} pts* from {settled} settled prediction{'s' if settled != 1 else ''}",
+        f"*{total_pts} pts* — #{rank} of {total_players}",
+        f"from {settled} settled prediction{'s' if settled != 1 else ''}",
     ]
     if exact:
         lines.append(f"✅ {exact} exact score{'s' if exact != 1 else ''} (+{exact_pts} pts)")
@@ -829,10 +871,8 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hit_rate = round((exact + correct_outcome) / settled * 100)
         lines.append(f"\n_Hit rate: {hit_rate}% ({exact + correct_outcome}/{settled})_")
 
-    winner_row = db.table("users").select("winner_pick").eq("telegram_id", uid).execute().data
-    winner_pick = winner_row[0].get("winner_pick") if winner_row else None
     if winner_pick:
-        bonus_note = " — 🏆 +10 pts awarded!" if TOURNAMENT_WINNER and winner_pick == TOURNAMENT_WINNER else ""
+        bonus_note = " — +10 pts awarded! 🏆" if winner_bonus else ""
         lines.append(f"\n🏆 Winner pick: {flag(winner_pick)}{bonus_note}")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
