@@ -1,5 +1,7 @@
 import os
 import logging
+import random
+import string
 import httpx
 from dotenv import load_dotenv
 from supabase import create_client
@@ -83,24 +85,19 @@ def round_multiplier(round_name: str) -> int:
     knockout = {"round of 16", "quarter-final", "quarter final", "semi-final", "semi final", "third place", "final"}
     return 2 if (round_name or "").lower() in knockout else 1
 
-def _save_group_chat_id(chat_id: int):
-    db.table("settings").upsert({"key": "group_chat_id", "value": str(chat_id)}).execute()
-
-def _register_group_member(chat_id: int, telegram_id: int):
-    try:
-        db.table("group_members").upsert(
-            {"chat_id": chat_id, "telegram_id": telegram_id},
-            on_conflict="chat_id,telegram_id",
-        ).execute()
-    except Exception:
-        pass
+def _generate_league_code() -> str:
+    chars = string.ascii_uppercase + string.digits
+    while True:
+        code = "".join(random.choices(chars, k=6))
+        if not db.table("leagues").select("id").eq("code", code).execute().data:
+            return code
 
 def _build_leaderboard_text(title: str, user_ids=None) -> str:
     from collections import defaultdict
     q = db.table("users").select("telegram_id, name, winner_pick")
     if user_ids is not None:
         if not user_ids:
-            return "No players in this group yet\\."
+            return "No players in this league yet\\."
         q = q.in_("telegram_id", user_ids)
     users = q.execute().data
     if not users:
@@ -152,20 +149,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "telegram_id": user.id,
         "name": user.first_name,
     }).execute()
-    if update.effective_chat.type in ("group", "supergroup"):
-        _register_group_member(update.effective_chat.id, user.id)
     await update.message.reply_text(
         f"⚽ Hey {user.first_name}! Welcome to the World Cup 2026 prediction game.\n\n"
-        "/predict – predict a scoreline, e.g. /predict Brazil 2-1 Morocco\n"
-        "/next – see the next 3 upcoming matches\n"
+        "/predict – predict a scoreline\n"
+        "/next – next 3 upcoming matches\n"
         "/winner – pick your tournament winner (+10 bonus pts)\n"
         "/mypoints – your score and breakdown\n"
+        "/leaderboard – your league standings\n"
+        "/masterleaderboard – everyone across all leagues\n"
+        "/createleague – start a private league with friends\n"
+        "/joinleague – join a league with a code\n"
+        "/myleague – see your leagues and share codes\n"
         "/whopicked – see everyone's pick after kickoff\n"
         "/fixtures – full fixture list\n"
         "/mypredictions – review or cancel your picks\n"
-        "/leaderboard – full standings\n"
         "/remind – kickoff reminders, e.g. /remind 30\n"
-        "/digest – daily match list, e.g. /digest 20 for 8pm SGT\n"
+        "/digest – daily match digest\n"
         "/ping – check I'm alive"
     )
 
@@ -314,8 +313,6 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
-    if update.effective_chat.type in ("group", "supergroup"):
-        _register_group_member(update.effective_chat.id, user.id)
     text, keyboard = _build_predict_keyboard(user.id, 0)
     if not text:
         await update.message.reply_text("No upcoming matches to predict right now.")
@@ -430,8 +427,6 @@ async def _predict_from_args(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
-    if update.effective_chat.type in ("group", "supergroup"):
-        _register_group_member(update.effective_chat.id, user.id)
 
     matches = db.table("matches").select("*").eq("status", "scheduled").execute().data
     t1, t2 = team1_text.lower(), team2_text.lower()
@@ -735,21 +730,30 @@ async def cancel_pred_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    is_group = chat.type in ("group", "supergroup")
+    uid = update.effective_user.id
+    memberships = db.table("league_members").select("league_id").eq("telegram_id", uid).execute().data
 
-    if is_group:
-        _register_group_member(chat.id, update.effective_user.id)
-        members = db.table("group_members").select("telegram_id").eq("chat_id", chat.id).execute().data
+    if not memberships:
+        text = _build_leaderboard_text("Master Leaderboard")
+        await update.message.reply_text(text, parse_mode="MarkdownV2")
+        return
+
+    league_ids = [m["league_id"] for m in memberships]
+    leagues = db.table("leagues").select("*").in_("id", league_ids).execute().data
+
+    if len(leagues) == 1:
+        league = leagues[0]
+        members = db.table("league_members").select("telegram_id").eq("league_id", league["id"]).execute().data
         user_ids = [m["telegram_id"] for m in members]
-        text = _build_leaderboard_text("Group Leaderboard", user_ids)
+        text = _build_leaderboard_text(league["name"], user_ids)
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("🌍 Master Leaderboard", callback_data="leaderboard:global")
         ]])
         await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=keyboard)
     else:
-        text = _build_leaderboard_text("Master Leaderboard")
-        await update.message.reply_text(text, parse_mode="MarkdownV2")
+        buttons = [[InlineKeyboardButton(lg["name"], callback_data=f"leaderboard:league:{lg['id']}")] for lg in leagues]
+        buttons.append([InlineKeyboardButton("🌍 Master Leaderboard", callback_data="leaderboard:global")])
+        await update.message.reply_text("Which leaderboard?", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def leaderboard_global_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -759,10 +763,26 @@ async def leaderboard_global_cb(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(text, parse_mode="MarkdownV2")
 
 
+async def leaderboard_league_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    league_id = int(query.data.split(":")[-1])
+    league = db.table("leagues").select("*").eq("id", league_id).execute().data
+    if not league:
+        await query.edit_message_text("League not found.")
+        return
+    league = league[0]
+    members = db.table("league_members").select("telegram_id").eq("league_id", league_id).execute().data
+    user_ids = [m["telegram_id"] for m in members]
+    text = _build_leaderboard_text(league["name"], user_ids)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🌍 Master Leaderboard", callback_data="leaderboard:global")
+    ]])
+    await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=keyboard)
+
+
 async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if update.effective_chat.type in ("group", "supergroup"):
-        _register_group_member(update.effective_chat.id, uid)
 
     preds = db.table("predictions").select("*").eq("telegram_id", uid).execute().data
     if not preds:
@@ -937,20 +957,6 @@ async def _broadcast_match_result(bot, match, sh, sa):
         except Exception as e:
             logging.warning(f"Broadcast failed for {p['telegram_id']}: {e}")
 
-    # Post summary to all registered group chats
-    group_rows = db.table("group_members").select("chat_id").execute().data
-    group_chat_ids = list({row["chat_id"] for row in group_rows})
-    result_text = (
-        f"⚽ *Full time!*\n"
-        f"{flag(match['team1'])} {sh}–{sa} {flag(match['team2'])}\n\n"
-        f"📊 {correct}/{total} predicted correctly"
-        f" · Most picked: {top_pick[0]}–{top_pick[1]} ({top_count})"
-    )
-    for gcid in group_chat_ids:
-        try:
-            await bot.send_message(chat_id=gcid, text=result_text, parse_mode="Markdown")
-        except Exception as e:
-            logging.warning(f"Group broadcast failed for {gcid}: {e}")
 
 
 async def poll_results(context: ContextTypes.DEFAULT_TYPE):
@@ -1084,8 +1090,6 @@ async def next_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sgt = timezone(timedelta(hours=8))
     now = datetime.now(timezone.utc)
     uid = update.effective_user.id
-    if update.effective_chat.type in ("group", "supergroup"):
-        _register_group_member(update.effective_chat.id, uid)
 
     all_matches = (
         db.table("matches").select("*").eq("status", "scheduled").order("kickoff_utc").execute().data
@@ -1172,33 +1176,106 @@ async def whopicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
+async def createleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not context.args:
+        await update.message.reply_text(
+            "Give your league a name: `/createleague My Friends`",
+            parse_mode="Markdown",
+        )
         return
-    chat_id = update.effective_chat.id
-    _save_group_chat_id(chat_id)
+    name = " ".join(context.args).strip()
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
+    code = _generate_league_code()
+    result = db.table("leagues").insert({"name": name, "code": code}).execute()
+    league_id = result.data[0]["id"]
+    db.table("league_members").insert({"league_id": league_id, "telegram_id": user.id}).execute()
     await update.message.reply_text(
-        f"✅ Group channel set to this chat (ID: `{chat_id}`).\n"
-        "Match results will now be posted here.",
+        f"🏆 League *{name}* created!\n\n"
+        f"Share this code with your friends:\n"
+        f"`{code}`\n\n"
+        f"They join with: `/joinleague {code}`",
         parse_mode="Markdown",
     )
 
 
+async def joinleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not context.args:
+        await update.message.reply_text("Usage: `/joinleague ABC123`", parse_mode="Markdown")
+        return
+    code = context.args[0].upper()
+    row = db.table("leagues").select("*").eq("code", code).execute().data
+    if not row:
+        await update.message.reply_text(
+            f"No league found with code `{code}`\\. Check the code and try again.",
+            parse_mode="Markdown",
+        )
+        return
+    league = row[0]
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
+    existing = (
+        db.table("league_members")
+        .select("league_id")
+        .eq("league_id", league["id"])
+        .eq("telegram_id", user.id)
+        .execute().data
+    )
+    if existing:
+        await update.message.reply_text(f"You're already in *{league['name']}*!", parse_mode="Markdown")
+        return
+    db.table("league_members").insert({"league_id": league["id"], "telegram_id": user.id}).execute()
+    count = len(db.table("league_members").select("telegram_id").eq("league_id", league["id"]).execute().data)
+    await update.message.reply_text(
+        f"✅ Joined *{league['name']}*! ({count} member{'s' if count != 1 else ''})\n\n"
+        f"Use /leaderboard to see the standings.",
+        parse_mode="Markdown",
+    )
+
+
+async def myleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    memberships = db.table("league_members").select("league_id").eq("telegram_id", uid).execute().data
+    if not memberships:
+        await update.message.reply_text(
+            "You're not in any league yet.\n\n"
+            "Create one: `/createleague My Friends`\n"
+            "Or join one: `/joinleague ABC123`",
+            parse_mode="Markdown",
+        )
+        return
+    league_ids = [m["league_id"] for m in memberships]
+    leagues = db.table("leagues").select("*").in_("id", league_ids).execute().data
+    lines = ["🏆 *Your Leagues*\n"]
+    for lg in leagues:
+        count = len(db.table("league_members").select("telegram_id").eq("league_id", lg["id"]).execute().data)
+        lines.append(f"*{lg['name']}* — code: `{lg['code']}` ({count} member{'s' if count != 1 else ''})")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def masterleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = _build_leaderboard_text("Master Leaderboard")
+    await update.message.reply_text(text, parse_mode="MarkdownV2")
+
+
 async def set_commands(app):
     await app.bot.set_my_commands([
-        BotCommand("predict",        "Predict a match scoreline"),
-        BotCommand("next",           "See the next 3 upcoming matches"),
-        BotCommand("mypoints",       "Your score and stats"),
-        BotCommand("winner",         "Pick your tournament winner (+10 pts)"),
-        BotCommand("whopicked",      "See everyone's pick for a match"),
-        BotCommand("fixtures",       "Full fixture list"),
-        BotCommand("mypredictions",  "Review or cancel your picks"),
-        BotCommand("leaderboard",    "See the points standings"),
-        BotCommand("remind",         "Set kickoff reminders"),
-        BotCommand("digest",         "Daily match digest"),
-        BotCommand("start",          "Welcome & setup"),
-        BotCommand("ping",           "Check the bot is alive"),
+        BotCommand("predict",           "Predict a match scoreline"),
+        BotCommand("next",              "See the next 3 upcoming matches"),
+        BotCommand("mypoints",          "Your score and stats"),
+        BotCommand("winner",            "Pick your tournament winner (+10 pts)"),
+        BotCommand("leaderboard",       "Your league standings"),
+        BotCommand("masterleaderboard", "Everyone across all leagues"),
+        BotCommand("createleague",      "Create a new league"),
+        BotCommand("joinleague",        "Join a league with a code"),
+        BotCommand("myleague",          "See your leagues and share codes"),
+        BotCommand("whopicked",         "See everyone's pick for a match"),
+        BotCommand("fixtures",          "Full fixture list"),
+        BotCommand("mypredictions",     "Review or cancel your picks"),
+        BotCommand("remind",            "Set kickoff reminders"),
+        BotCommand("digest",            "Daily match digest"),
+        BotCommand("start",             "Welcome & setup"),
+        BotCommand("ping",              "Check the bot is alive"),
     ])
 
 
@@ -1233,13 +1310,17 @@ def main():
     app.add_handler(CommandHandler("mypredictions", mypredictions))
     app.add_handler(CallbackQueryHandler(cancel_pred_cb, pattern=r"^cancel_pred:.+$"))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("masterleaderboard", masterleaderboard))
     app.add_handler(CallbackQueryHandler(leaderboard_global_cb, pattern=r"^leaderboard:global$"))
+    app.add_handler(CallbackQueryHandler(leaderboard_league_cb, pattern=r"^leaderboard:league:\d+$"))
+    app.add_handler(CommandHandler("createleague", createleague))
+    app.add_handler(CommandHandler("joinleague", joinleague))
+    app.add_handler(CommandHandler("myleague", myleague))
     app.add_handler(CommandHandler("mypoints", mypoints))
     app.add_handler(CommandHandler("winner", winner))
     app.add_handler(CommandHandler("setresult", setresult))
     app.add_handler(CommandHandler("next", next_matches))
     app.add_handler(CommandHandler("whopicked", whopicked))
-    app.add_handler(CommandHandler("setgroup", setgroup))
     print("Bot running. Press Ctrl+C to stop.")
     app.run_polling()
 
