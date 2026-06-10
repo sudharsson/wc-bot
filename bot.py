@@ -26,7 +26,6 @@ db = create_client(SUPABASE_URL, SUPABASE_KEY)
 already_pinged = set()
 # Match IDs that have had a missed-prediction nudge sent this run.
 already_nudged = set()
-_group_chat_id = None  # lazily loaded from settings table
 PICK_MATCH, ENTER_SCORE = range(2)
 
 FLAGS = {
@@ -84,20 +83,58 @@ def round_multiplier(round_name: str) -> int:
     knockout = {"round of 16", "quarter-final", "quarter final", "semi-final", "semi final", "third place", "final"}
     return 2 if (round_name or "").lower() in knockout else 1
 
-def _load_group_chat_id() -> int:
-    global _group_chat_id
-    if _group_chat_id is None:
-        try:
-            row = db.table("settings").select("value").eq("key", "group_chat_id").execute().data
-            _group_chat_id = int(row[0]["value"]) if row else 0
-        except Exception:
-            _group_chat_id = 0
-    return _group_chat_id
-
 def _save_group_chat_id(chat_id: int):
-    global _group_chat_id
-    _group_chat_id = chat_id
     db.table("settings").upsert({"key": "group_chat_id", "value": str(chat_id)}).execute()
+
+def _register_group_member(chat_id: int, telegram_id: int):
+    try:
+        db.table("group_members").upsert(
+            {"chat_id": chat_id, "telegram_id": telegram_id},
+            on_conflict="chat_id,telegram_id",
+        ).execute()
+    except Exception:
+        pass
+
+def _build_leaderboard_text(title: str, user_ids=None) -> str:
+    from collections import defaultdict
+    q = db.table("users").select("telegram_id, name, winner_pick")
+    if user_ids is not None:
+        if not user_ids:
+            return "No players in this group yet\\."
+        q = q.in_("telegram_id", user_ids)
+    users = q.execute().data
+    if not users:
+        return "No players yet\\."
+    preds = db.table("predictions").select("*").execute().data
+    matches = db.table("matches").select("id, score_home, score_away, round").execute().data
+    match_map = {m["id"]: m for m in matches}
+    by_user = defaultdict(list)
+    for p in preds:
+        by_user[p["telegram_id"]].append(p)
+    def score_for(p):
+        m = match_map.get(p["match_id"])
+        if not m or m.get("score_home") is None:
+            return 0
+        return calc_points(p["pred_home"], p["pred_away"], m["score_home"], m["score_away"]) * round_multiplier(m.get("round", ""))
+    rows = []
+    for u in users:
+        uid = u["telegram_id"]
+        pts = sum(score_for(p) for p in by_user[uid])
+        winner_bonus = 10 if TOURNAMENT_WINNER and u.get("winner_pick") == TOURNAMENT_WINNER else 0
+        pts += winner_bonus
+        rows.append((pts, len(by_user[uid]), u.get("name") or "Anonymous", winner_bonus > 0))
+    rows.sort(key=lambda x: (-x[0], -x[1]))
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"🏆 *{title}*\n"]
+    for i, (pts, cnt, name, has_bonus) in enumerate(rows[:15]):
+        rank = medals[i] if i < 3 else f"{i + 1}\\."
+        bonus = " 🏆" if has_bonus else ""
+        lines.append(f"{rank} {name}{bonus}  —  {pts} pts  _({cnt} predictions)_")
+    if TOURNAMENT_WINNER:
+        lines.append(f"\n_🏆 = +10 winner bonus ({flag(TOURNAMENT_WINNER)})_")
+    elif not any(r[0] > 0 for r in rows):
+        lines.append("\n_Points will appear once match results are in\\._")
+    return "\n".join(lines)
 
 def calc_points(pred_home, pred_away, score_home, score_away) -> int:
     ph, pa, sh, sa = pred_home, pred_away, score_home, score_away
@@ -115,6 +152,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "telegram_id": user.id,
         "name": user.first_name,
     }).execute()
+    if update.effective_chat.type in ("group", "supergroup"):
+        _register_group_member(update.effective_chat.id, user.id)
     await update.message.reply_text(
         f"⚽ Hey {user.first_name}! Welcome to the World Cup 2026 prediction game.\n\n"
         "/predict – predict a scoreline, e.g. /predict Brazil 2-1 Morocco\n"
@@ -275,6 +314,8 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
+    if update.effective_chat.type in ("group", "supergroup"):
+        _register_group_member(update.effective_chat.id, user.id)
     text, keyboard = _build_predict_keyboard(user.id, 0)
     if not text:
         await update.message.reply_text("No upcoming matches to predict right now.")
@@ -389,6 +430,8 @@ async def _predict_from_args(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
+    if update.effective_chat.type in ("group", "supergroup"):
+        _register_group_member(update.effective_chat.id, user.id)
 
     matches = db.table("matches").select("*").eq("status", "scheduled").execute().data
     t1, t2 = team1_text.lower(), team2_text.lower()
@@ -692,55 +735,34 @@ async def cancel_pred_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from collections import defaultdict
+    chat = update.effective_chat
+    is_group = chat.type in ("group", "supergroup")
 
-    users = db.table("users").select("telegram_id, name, winner_pick").execute().data
-    if not users:
-        await update.message.reply_text("No players yet!")
-        return
+    if is_group:
+        _register_group_member(chat.id, update.effective_user.id)
+        members = db.table("group_members").select("telegram_id").eq("chat_id", chat.id).execute().data
+        user_ids = [m["telegram_id"] for m in members]
+        text = _build_leaderboard_text("Group Leaderboard", user_ids)
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🌍 Master Leaderboard", callback_data="leaderboard:global")
+        ]])
+        await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=keyboard)
+    else:
+        text = _build_leaderboard_text("Master Leaderboard")
+        await update.message.reply_text(text, parse_mode="MarkdownV2")
 
-    preds = db.table("predictions").select("*").execute().data
-    matches = db.table("matches").select("id, score_home, score_away, round").execute().data
-    match_map = {m["id"]: m for m in matches}
 
-    by_user = defaultdict(list)
-    for p in preds:
-        by_user[p["telegram_id"]].append(p)
-
-    def score_for(p):
-        m = match_map.get(p["match_id"])
-        if not m or m.get("score_home") is None:
-            return 0
-        return calc_points(p["pred_home"], p["pred_away"], m["score_home"], m["score_away"]) * round_multiplier(m.get("round", ""))
-
-    rows = []
-    for u in users:
-        uid = u["telegram_id"]
-        ups = by_user[uid]
-        pts = sum(score_for(p) for p in ups)
-        winner_bonus = 10 if TOURNAMENT_WINNER and u.get("winner_pick") == TOURNAMENT_WINNER else 0
-        pts += winner_bonus
-        rows.append((pts, len(ups), u.get("name") or "Anonymous", winner_bonus > 0))
-
-    rows.sort(key=lambda x: (-x[0], -x[1]))
-
-    medals = ["🥇", "🥈", "🥉"]
-    lines = ["🏆 *Leaderboard*\n"]
-    for i, (pts, cnt, name, has_bonus) in enumerate(rows[:15]):
-        rank = medals[i] if i < 3 else f"{i + 1}\\."
-        bonus = " 🏆" if has_bonus else ""
-        lines.append(f"{rank} {name}{bonus}  —  {pts} pts  _({cnt} predictions)_")
-
-    if TOURNAMENT_WINNER:
-        lines.append(f"\n_🏆 = +10 winner bonus ({flag(TOURNAMENT_WINNER)})_")
-    elif not any(r[0] > 0 for r in rows):
-        lines.append("\n_Points will appear once match results are in._")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+async def leaderboard_global_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    text = _build_leaderboard_text("Master Leaderboard")
+    await query.edit_message_text(text, parse_mode="MarkdownV2")
 
 
 async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if update.effective_chat.type in ("group", "supergroup"):
+        _register_group_member(update.effective_chat.id, uid)
 
     preds = db.table("predictions").select("*").eq("telegram_id", uid).execute().data
     if not preds:
@@ -915,22 +937,20 @@ async def _broadcast_match_result(bot, match, sh, sa):
         except Exception as e:
             logging.warning(f"Broadcast failed for {p['telegram_id']}: {e}")
 
-    # Post summary to group chat if one is configured
-    gcid = _load_group_chat_id()
-    if gcid:
+    # Post summary to all registered group chats
+    group_rows = db.table("group_members").select("chat_id").execute().data
+    group_chat_ids = list({row["chat_id"] for row in group_rows})
+    result_text = (
+        f"⚽ *Full time!*\n"
+        f"{flag(match['team1'])} {sh}–{sa} {flag(match['team2'])}\n\n"
+        f"📊 {correct}/{total} predicted correctly"
+        f" · Most picked: {top_pick[0]}–{top_pick[1]} ({top_count})"
+    )
+    for gcid in group_chat_ids:
         try:
-            await bot.send_message(
-                chat_id=gcid,
-                text=(
-                    f"⚽ *Full time!*\n"
-                    f"{flag(match['team1'])} {sh}–{sa} {flag(match['team2'])}\n\n"
-                    f"📊 {correct}/{total} predicted correctly"
-                    f" · Most picked: {top_pick[0]}–{top_pick[1]} ({top_count})"
-                ),
-                parse_mode="Markdown",
-            )
+            await bot.send_message(chat_id=gcid, text=result_text, parse_mode="Markdown")
         except Exception as e:
-            logging.warning(f"Group broadcast failed: {e}")
+            logging.warning(f"Group broadcast failed for {gcid}: {e}")
 
 
 async def poll_results(context: ContextTypes.DEFAULT_TYPE):
@@ -1064,6 +1084,8 @@ async def next_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sgt = timezone(timedelta(hours=8))
     now = datetime.now(timezone.utc)
     uid = update.effective_user.id
+    if update.effective_chat.type in ("group", "supergroup"):
+        _register_group_member(update.effective_chat.id, uid)
 
     all_matches = (
         db.table("matches").select("*").eq("status", "scheduled").order("kickoff_utc").execute().data
@@ -1211,6 +1233,7 @@ def main():
     app.add_handler(CommandHandler("mypredictions", mypredictions))
     app.add_handler(CallbackQueryHandler(cancel_pred_cb, pattern=r"^cancel_pred:.+$"))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CallbackQueryHandler(leaderboard_global_cb, pattern=r"^leaderboard:global$"))
     app.add_handler(CommandHandler("mypoints", mypoints))
     app.add_handler(CommandHandler("winner", winner))
     app.add_handler(CommandHandler("setresult", setresult))
