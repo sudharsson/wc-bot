@@ -229,6 +229,9 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     minutes = int(choice)
+    if minutes > 180:
+        await update.message.reply_text("Max reminder is 180 minutes before kickoff.")
+        return
     db.table("users").upsert({
         "telegram_id": user.id,
         "name": user.first_name,
@@ -932,6 +935,9 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if _is_rate_limited(user.id):
+        await update.message.reply_text("⏳ Slow down! Wait a moment and try again.")
+        return
     args = context.args
 
     if not args:
@@ -978,6 +984,9 @@ async def winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def goldenboot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if _is_rate_limited(user.id):
+        await update.message.reply_text("⏳ Slow down! Wait a moment and try again.")
+        return
     args = context.args
 
     if not args:
@@ -1018,6 +1027,9 @@ async def goldenboot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def goldenball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if _is_rate_limited(user.id):
+        await update.message.reply_text("⏳ Slow down! Wait a moment and try again.")
+        return
     args = context.args
 
     if not args:
