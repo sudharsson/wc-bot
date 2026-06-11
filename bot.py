@@ -22,6 +22,8 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 TOURNAMENT_WINNER = os.environ.get("TOURNAMENT_WINNER", "")
+GOLDEN_BOOT_WINNER = os.environ.get("GOLDEN_BOOT_WINNER", "")
+GOLDEN_BALL_WINNER = os.environ.get("GOLDEN_BALL_WINNER", "")
 
 # One database connection the whole bot shares.
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -106,7 +108,7 @@ def _generate_league_code() -> str:
 
 def _build_leaderboard_text(title: str, user_ids=None) -> str:
     from collections import defaultdict
-    q = db.table("users").select("telegram_id, name, winner_pick")
+    q = db.table("users").select("telegram_id, name, winner_pick, golden_boot_pick, golden_ball_pick")
     if user_ids is not None:
         if not user_ids:
             return "No players in this league yet\\."
@@ -130,17 +132,26 @@ def _build_leaderboard_text(title: str, user_ids=None) -> str:
         uid = u["telegram_id"]
         pts = sum(score_for(p) for p in by_user[uid])
         winner_bonus = 10 if TOURNAMENT_WINNER and u.get("winner_pick") == TOURNAMENT_WINNER else 0
-        pts += winner_bonus
-        rows.append((pts, len(by_user[uid]), u.get("name") or "Anonymous", winner_bonus > 0))
+        boot_bonus = 5 if GOLDEN_BOOT_WINNER and (u.get("golden_boot_pick") or "").lower() == GOLDEN_BOOT_WINNER.lower() else 0
+        ball_bonus = 5 if GOLDEN_BALL_WINNER and (u.get("golden_ball_pick") or "").lower() == GOLDEN_BALL_WINNER.lower() else 0
+        pts += winner_bonus + boot_bonus + ball_bonus
+        rows.append((pts, len(by_user[uid]), u.get("name") or "Anonymous", winner_bonus + boot_bonus + ball_bonus))
     rows.sort(key=lambda x: (-x[0], -x[1]))
     medals = ["🥇", "🥈", "🥉"]
     lines = [f"🏆 *{title}*\n"]
-    for i, (pts, cnt, name, has_bonus) in enumerate(rows[:15]):
+    for i, (pts, cnt, name, bonus_pts) in enumerate(rows[:15]):
         rank = medals[i] if i < 3 else f"{i + 1}\\."
-        bonus = " 🏆" if has_bonus else ""
+        bonus = " ⭐" if bonus_pts > 0 else ""
         lines.append(f"{rank} {name}{bonus}  —  {pts} pts  _({cnt} predictions)_")
+    notes = []
     if TOURNAMENT_WINNER:
-        lines.append(f"\n_🏆 = +10 winner bonus ({flag(TOURNAMENT_WINNER)})_")
+        notes.append(f"🏆 \\+10 winner")
+    if GOLDEN_BOOT_WINNER:
+        notes.append(f"👟 \\+5 golden boot")
+    if GOLDEN_BALL_WINNER:
+        notes.append(f"🏅 \\+5 golden ball")
+    if notes:
+        lines.append("\n_⭐ = bonus pts: " + " · ".join(notes) + "_")
     elif not any(r[0] > 0 for r in rows):
         lines.append("\n_Points will appear once match results are in\\._")
     return "\n".join(lines)
@@ -168,10 +179,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Exact scoreline → *3 pts*\n"
         "• Correct outcome (win or draw) → *1 pt*\n"
         "• Knockout rounds → points are *doubled*\n"
-        "• Pick the tournament winner → *+10 bonus pts*\n\n"
+        "• Pick the tournament winner → *+10 bonus pts*\n"
+        "• Pick the Golden Boot winner → *+5 bonus pts*\n"
+        "• Pick the Golden Ball winner → *+5 bonus pts*\n\n"
         "🚀 *Get started in 3 steps:*\n"
         "1️⃣ /predict — pick your first match scoreline\n"
-        "2️⃣ /winner — choose who lifts the trophy\n"
+        "2️⃣ /winner · /goldenboot · /goldenball — pick your award winners\n"
         "3️⃣ /createleague MyLeagueName — create a private league and share the join code with friends\n"
         "   (or /joinleague CODE if a friend already made one)\n\n"
         "📋 *All commands:*\n"
@@ -198,8 +211,8 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args:
         await update.message.reply_text(
             "Set how early I ping you before kickoff:\n"
-            "/remind 30  – 30 minutes before\n"
-            "/remind 5   – 5 minutes before\n"
+            "/remind 30 mins  – 30 minutes before\n"
+            "/remind 5 mins  – 5 minutes before\n"
             "/remind off – stop reminders"
         )
         return
@@ -848,13 +861,18 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
             correct_outcome += 1
             outcome_pts += pts
 
-    winner_row = db.table("users").select("winner_pick").eq("telegram_id", uid).execute().data
-    winner_pick = winner_row[0].get("winner_pick") if winner_row else None
+    user_row = db.table("users").select("winner_pick, golden_boot_pick, golden_ball_pick").eq("telegram_id", uid).execute().data
+    user_row = user_row[0] if user_row else {}
+    winner_pick = user_row.get("winner_pick")
+    boot_pick = user_row.get("golden_boot_pick")
+    ball_pick = user_row.get("golden_ball_pick")
     winner_bonus = 10 if TOURNAMENT_WINNER and winner_pick == TOURNAMENT_WINNER else 0
-    total_pts += winner_bonus
+    boot_bonus = 5 if GOLDEN_BOOT_WINNER and (boot_pick or "").lower() == GOLDEN_BOOT_WINNER.lower() else 0
+    ball_bonus = 5 if GOLDEN_BALL_WINNER and (ball_pick or "").lower() == GOLDEN_BALL_WINNER.lower() else 0
+    total_pts += winner_bonus + boot_bonus + ball_bonus
 
     # Compute rank across all players
-    all_users = db.table("users").select("telegram_id, winner_pick").execute().data
+    all_users = db.table("users").select("telegram_id, winner_pick, golden_boot_pick, golden_ball_pick").execute().data
     all_preds = db.table("predictions").select("*").execute().data
     all_matches_data = db.table("matches").select("id, score_home, score_away, round").execute().data
     all_match_map = {m["id"]: m for m in all_matches_data}
@@ -873,6 +891,10 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if TOURNAMENT_WINNER and u.get("winner_pick") == TOURNAMENT_WINNER:
             s += 10
+        if GOLDEN_BOOT_WINNER and (u.get("golden_boot_pick") or "").lower() == GOLDEN_BOOT_WINNER.lower():
+            s += 5
+        if GOLDEN_BALL_WINNER and (u.get("golden_ball_pick") or "").lower() == GOLDEN_BALL_WINNER.lower():
+            s += 5
         return s
 
     all_scores = sorted([user_total(u) for u in all_users], reverse=True)
@@ -896,8 +918,14 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"\n_Hit rate: {hit_rate}% ({exact + correct_outcome}/{settled})_")
 
     if winner_pick:
-        bonus_note = " — +10 pts awarded! 🏆" if winner_bonus else ""
-        lines.append(f"\n🏆 Winner pick: {flag(winner_pick)}{bonus_note}")
+        note = " ✅ +10 pts!" if winner_bonus else ""
+        lines.append(f"\n🏆 Winner: {flag(winner_pick)}{note}")
+    if boot_pick:
+        note = " ✅ +5 pts!" if boot_bonus else ""
+        lines.append(f"👟 Golden Boot: {boot_pick}{note}")
+    if ball_pick:
+        note = " ✅ +5 pts!" if ball_bonus else ""
+        lines.append(f"🏅 Golden Ball: {ball_pick}{note}")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -944,6 +972,86 @@ async def winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🏆 Winner pick saved: {flag(matched)}\n\n"
         "_Correct pick = +10 bonus pts at the final!_",
+        parse_mode="Markdown",
+    )
+
+
+async def goldenboot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args
+
+    if not args:
+        row = db.table("users").select("golden_boot_pick").eq("telegram_id", user.id).execute().data
+        current = (row[0].get("golden_boot_pick") if row else None)
+        if current:
+            await update.message.reply_text(
+                f"👟 Your Golden Boot pick: *{current}*\n\n"
+                "_To change: /goldenboot Player Name_\n"
+                "_To clear: /goldenboot off_",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                "👟 *Who'll be the top scorer?*\n\n"
+                "Set your pick: `/goldenboot Kylian Mbappe`\n"
+                "Correct pick = *+5 bonus points!*",
+                parse_mode="Markdown",
+            )
+        return
+
+    if args[0].lower() == "off":
+        db.table("users").update({"golden_boot_pick": None}).eq("telegram_id", user.id).execute()
+        await update.message.reply_text("👟 Golden Boot pick cleared.")
+        return
+
+    pick = " ".join(args).strip()
+    if len(pick) > 50:
+        await update.message.reply_text("That name is too long. Try again.")
+        return
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name, "golden_boot_pick": pick}).execute()
+    await update.message.reply_text(
+        f"👟 Golden Boot pick saved: *{pick}*\n\n"
+        "_Correct pick = +5 bonus pts!_",
+        parse_mode="Markdown",
+    )
+
+
+async def goldenball(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args
+
+    if not args:
+        row = db.table("users").select("golden_ball_pick").eq("telegram_id", user.id).execute().data
+        current = (row[0].get("golden_ball_pick") if row else None)
+        if current:
+            await update.message.reply_text(
+                f"🏅 Your Golden Ball pick: *{current}*\n\n"
+                "_To change: /goldenball Player Name_\n"
+                "_To clear: /goldenball off_",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                "🏅 *Who'll be the best player?*\n\n"
+                "Set your pick: `/goldenball Lamine Yamal`\n"
+                "Correct pick = *+5 bonus points!*",
+                parse_mode="Markdown",
+            )
+        return
+
+    if args[0].lower() == "off":
+        db.table("users").update({"golden_ball_pick": None}).eq("telegram_id", user.id).execute()
+        await update.message.reply_text("🏅 Golden Ball pick cleared.")
+        return
+
+    pick = " ".join(args).strip()
+    if len(pick) > 50:
+        await update.message.reply_text("That name is too long. Try again.")
+        return
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name, "golden_ball_pick": pick}).execute()
+    await update.message.reply_text(
+        f"🏅 Golden Ball pick saved: *{pick}*\n\n"
+        "_Correct pick = +5 bonus pts!_",
         parse_mode="Markdown",
     )
 
@@ -1348,6 +1456,8 @@ async def set_commands(app):
         BotCommand("next",              "See the next 3 upcoming matches"),
         BotCommand("mypoints",          "Your score and stats"),
         BotCommand("winner",            "Pick your tournament winner (+10 pts)"),
+        BotCommand("goldenboot",        "Pick the top scorer (+5 pts)"),
+        BotCommand("goldenball",        "Pick the best player (+5 pts)"),
         BotCommand("leaderboard",       "Your league standings"),
         BotCommand("masterleaderboard", "Everyone across all leagues"),
         BotCommand("createleague",      "Create a new league"),
@@ -1402,6 +1512,8 @@ def main():
     app.add_handler(CommandHandler("myleague", myleague))
     app.add_handler(CommandHandler("mypoints", mypoints))
     app.add_handler(CommandHandler("winner", winner))
+    app.add_handler(CommandHandler("goldenboot", goldenboot))
+    app.add_handler(CommandHandler("goldenball", goldenball))
     app.add_handler(CommandHandler("setresult", setresult))
     app.add_handler(CommandHandler("next", next_matches))
     app.add_handler(CommandHandler("whopicked", whopicked))
