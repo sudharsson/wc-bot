@@ -920,6 +920,10 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hit_rate = round((exact + correct_outcome) / settled * 100)
         lines.append(f"\n_Hit rate: {hit_rate}% ({exact + correct_outcome}/{settled})_")
 
+    streak = _compute_streak(uid, preds_by_user, all_match_map)
+    if streak >= 2:
+        lines.append(f"\n🔥 {streak} correct in a row!")
+
     if winner_pick:
         note = " ✅ +10 pts!" if winner_bonus else ""
         lines.append(f"\n🏆 Winner: {flag(winner_pick)}{note}")
@@ -1068,6 +1072,24 @@ async def goldenball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _compute_streak(uid: int, preds_by_user: dict, match_map: dict) -> int:
+    results = []
+    for p in preds_by_user[uid]:
+        m = match_map.get(p["match_id"])
+        if not m or m.get("score_home") is None:
+            continue
+        pts = calc_points(p["pred_home"], p["pred_away"], m["score_home"], m["score_away"])
+        results.append((m.get("kickoff_utc", ""), pts > 0))
+    results.sort(key=lambda x: x[0])
+    streak = 0
+    for _, correct_pred in reversed(results):
+        if correct_pred:
+            streak += 1
+        else:
+            break
+    return streak
+
+
 async def _broadcast_match_result(bot, match, sh, sa):
     """DM every predictor with result, points, streak, and group stats. Also posts to group chat."""
     from collections import Counter, defaultdict
@@ -1096,23 +1118,6 @@ async def _broadcast_match_result(bot, match, sh, sa):
     for p in all_preds:
         preds_by_user[p["telegram_id"]].append(p)
 
-    def compute_streak(uid):
-        results = []
-        for p in preds_by_user[uid]:
-            m = streak_match_map.get(p["match_id"])
-            if not m or m.get("score_home") is None:
-                continue
-            pts = calc_points(p["pred_home"], p["pred_away"], m["score_home"], m["score_away"])
-            results.append((m.get("kickoff_utc", ""), pts > 0))
-        results.sort(key=lambda x: x[0])
-        streak = 0
-        for _, correct_pred in reversed(results):
-            if correct_pred:
-                streak += 1
-            else:
-                break
-        return streak
-
     for p in preds:
         pts = calc_points(p["pred_home"], p["pred_away"], sh, sa) * mult
         if pts >= 3:
@@ -1122,7 +1127,7 @@ async def _broadcast_match_result(bot, match, sh, sa):
         else:
             verdict = "❌ Unlucky. +0 pts"
 
-        streak = compute_streak(p["telegram_id"])
+        streak = _compute_streak(p["telegram_id"], preds_by_user, streak_match_map)
         streak_line = f"\n🔥 {streak} correct in a row!" if streak >= 3 else (f"\n🔥 {streak} in a row!" if streak == 2 else "")
 
         try:
@@ -1435,6 +1440,7 @@ async def joinleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def myleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from collections import defaultdict
     uid = update.effective_user.id
     memberships = db.table("league_members").select("league_id").eq("telegram_id", uid).execute().data
     if not memberships:
@@ -1447,10 +1453,23 @@ async def myleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     league_ids = [m["league_id"] for m in memberships]
     leagues = db.table("leagues").select("*").in_("id", league_ids).execute().data
+
+    all_member_rows = db.table("league_members").select("league_id, telegram_id").in_("league_id", league_ids).execute().data
+    all_member_ids = list({r["telegram_id"] for r in all_member_rows})
+    user_rows = db.table("users").select("telegram_id, name").in_("telegram_id", all_member_ids).execute().data
+    user_name_map = {u["telegram_id"]: u.get("name") or "Anonymous" for u in user_rows}
+
+    members_by_league = defaultdict(list)
+    for r in all_member_rows:
+        members_by_league[r["league_id"]].append(r["telegram_id"])
+
     lines = ["🏆 *Your Leagues*\n"]
     for lg in leagues:
-        count = len(db.table("league_members").select("telegram_id").eq("league_id", lg["id"]).execute().data)
+        member_ids = members_by_league[lg["id"]]
+        count = len(member_ids)
+        names = ", ".join(user_name_map.get(mid, "Anonymous") for mid in member_ids)
         lines.append(f"*{lg['name']}* — code: `{lg['code']}` ({count} member{'s' if count != 1 else ''})")
+        lines.append(f"_{names}_\n")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
