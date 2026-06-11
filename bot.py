@@ -198,7 +198,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/myleague — your leagues and share codes\n"
         "/remind 30 — reminder 30 min before kickoff\n"
         "/digest 20 — daily digest at 8pm SGT\n\n"
-        "_Predictions lock the moment a match kicks off. Good luck!_ 🍀",
+        "_Predictions lock the moment a match kicks off. Good luck!_",
         parse_mode="Markdown",
     )
 
