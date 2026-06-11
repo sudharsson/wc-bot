@@ -2,6 +2,7 @@ import os
 import logging
 import random
 import string
+import time
 import httpx
 from dotenv import load_dotenv
 from supabase import create_client
@@ -29,6 +30,16 @@ already_pinged = set()
 # Match IDs that have had a missed-prediction nudge sent this run.
 already_nudged = set()
 PICK_MATCH, ENTER_SCORE = range(2)
+
+# Rate limiting: tracks last command timestamp per user.
+_last_command: dict[int, float] = {}
+
+def _is_rate_limited(user_id: int, seconds: float = 2.0) -> bool:
+    now = time.time()
+    if now - _last_command.get(user_id, 0) < seconds:
+        return True
+    _last_command[user_id] = now
+    return False
 
 FLAGS = {
     # South America
@@ -87,10 +98,11 @@ def round_multiplier(round_name: str) -> int:
 
 def _generate_league_code() -> str:
     chars = string.ascii_uppercase + string.digits
-    while True:
+    for _ in range(10):
         code = "".join(random.choices(chars, k=6))
         if not db.table("leagues").select("id").eq("code", code).execute().data:
             return code
+    raise RuntimeError("Could not generate a unique league code after 10 attempts")
 
 def _build_leaderboard_text(title: str, user_ids=None) -> str:
     from collections import defaultdict
@@ -386,6 +398,9 @@ async def predict_enter_score(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ENTER_SCORE  # ask again
 
     pred_home, pred_away = int(parts[0]), int(parts[1])
+    if pred_home > 20 or pred_away > 20:
+        await update.message.reply_text("That score looks a bit off — max 20 goals per side. Try again.")
+        return ENTER_SCORE
 
     from datetime import datetime, timezone
     if datetime.now(timezone.utc) >= datetime.fromisoformat(m["kickoff_utc"]):
@@ -433,6 +448,9 @@ async def _predict_from_args(update: Update, context: ContextTypes.DEFAULT_TYPE)
         pred_home, pred_away = [int(x) for x in args[score_idx].split("-")]
     except ValueError:
         await update.message.reply_text("Score should look like 2-1. Try again.")
+        return
+    if pred_home > 20 or pred_away > 20:
+        await update.message.reply_text("That score looks a bit off — max 20 goals per side.")
         return
 
     db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
@@ -740,6 +758,9 @@ async def cancel_pred_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if _is_rate_limited(uid):
+        await update.message.reply_text("⏳ Slow down! Wait a moment and try again.")
+        return
     memberships = db.table("league_members").select("league_id").eq("telegram_id", uid).execute().data
 
     if not memberships:
@@ -793,6 +814,9 @@ async def leaderboard_league_cb(update: Update, context: ContextTypes.DEFAULT_TY
 async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from collections import defaultdict
     uid = update.effective_user.id
+    if _is_rate_limited(uid):
+        await update.message.reply_text("⏳ Slow down! Wait a moment and try again.")
+        return
 
     preds = db.table("predictions").select("*").eq("telegram_id", uid).execute().data
     if not preds:
@@ -1073,7 +1097,7 @@ async def poll_results(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def setresult(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Admin only.")
         return
 
@@ -1161,6 +1185,9 @@ async def whopicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(args) < 2:
         await update.message.reply_text("Usage: /whopicked Brazil Morocco")
         return
+    if any(len(a) > 50 for a in args):
+        await update.message.reply_text("Team name too long. Check spelling and try again.")
+        return
 
     # Parse team names (ignore any score token if present)
     score_idx = next((i for i, a in enumerate(args) if "-" in a and any(c.isdigit() for c in a)), None)
@@ -1225,11 +1252,22 @@ async def createleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     name = " ".join(context.args).strip()
-    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
-    code = _generate_league_code()
-    result = db.table("leagues").insert({"name": name, "code": code}).execute()
-    league_id = result.data[0]["id"]
-    db.table("league_members").insert({"league_id": league_id, "telegram_id": user.id}).execute()
+    if len(name) > 30:
+        await update.message.reply_text("League name must be 30 characters or fewer.")
+        return
+    if _is_rate_limited(user.id):
+        await update.message.reply_text("⏳ Slow down! Wait a moment and try again.")
+        return
+    try:
+        db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
+        code = _generate_league_code()
+        result = db.table("leagues").insert({"name": name, "code": code}).execute()
+        league_id = result.data[0]["id"]
+        db.table("league_members").insert({"league_id": league_id, "telegram_id": user.id}).execute()
+    except Exception as e:
+        logging.error(f"createleague failed for {user.id}: {e}")
+        await update.message.reply_text("❌ Couldn't create the league. Please try again later.")
+        return
     await update.message.reply_text(
         f"🏆 League *{name}* created!\n\n"
         f"Share this code with your friends:\n"
@@ -1244,7 +1282,10 @@ async def joinleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: `/joinleague ABC123`", parse_mode="Markdown")
         return
-    code = context.args[0].upper()
+    if _is_rate_limited(user.id):
+        await update.message.reply_text("⏳ Slow down! Wait a moment and try again.")
+        return
+    code = context.args[0][:10].upper()
     row = db.table("leagues").select("*").eq("code", code).execute().data
     if not row:
         await update.message.reply_text(
@@ -1294,6 +1335,9 @@ async def myleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def masterleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _is_rate_limited(update.effective_user.id):
+        await update.message.reply_text("⏳ Slow down! Wait a moment and try again.")
+        return
     text = _build_leaderboard_text("Master Leaderboard")
     await update.message.reply_text(text, parse_mode="MarkdownV2")
 
