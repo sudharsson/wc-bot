@@ -93,6 +93,23 @@ FLAGS = {
 
 _MD_SPECIAL = re.compile(r'([_*\[\]()~`>#+\-=|{}.!\\])')
 
+def _team_names_match(db_name: str, api_name: str) -> bool:
+    """Return True if db_name and api_name refer to the same team.
+    Handles variants like 'South Korea' vs 'Korea Republic', 'Czech Republic' vs 'Czechia'."""
+    d, a = db_name.lower(), api_name.lower()
+    if d in a or a in d:
+        return True
+    d_words = {w for w in d.split() if len(w) > 2}
+    a_words = {w for w in a.split() if len(w) > 2}
+    if d_words & a_words:
+        return True
+    # Prefix match handles "czech" → "czechia", "korea" in both names
+    for dw in d_words:
+        for aw in a_words:
+            if aw.startswith(dw) or dw.startswith(aw):
+                return True
+    return False
+
 def _escape_md(text: str) -> str:
     return _MD_SPECIAL.sub(r'\\\1', str(text))
 
@@ -1215,7 +1232,7 @@ async def poll_results(context: ContextTypes.DEFAULT_TYPE):
         result = api_lookup.get((t1, t2))
         if not result:
             for (ah, aa), scores in api_lookup.items():
-                if (t1 in ah or ah in t1) and (t2 in aa or aa in t2):
+                if _team_names_match(t1, ah) and _team_names_match(t2, aa):
                     result = scores
                     break
 
@@ -1311,7 +1328,7 @@ async def syncresults(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = api_lookup.get((t1, t2))
         if not result:
             for (ah, aa), scores in api_lookup.items():
-                if (t1 in ah or ah in t1) and (t2 in aa or aa in t2):
+                if _team_names_match(t1, ah) and _team_names_match(t2, aa):
                     result = scores
                     break
         if result:
@@ -1443,7 +1460,7 @@ async def whatsthescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fixture = live_lookup.get((t1, t2))
         if not fixture:
             for (ah, aa), f in live_lookup.items():
-                if (t1 in ah or ah in t1) and (t2 in aa or aa in t2):
+                if _team_names_match(t1, ah) and _team_names_match(t2, aa):
                     fixture = f
                     break
 
