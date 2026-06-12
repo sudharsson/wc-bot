@@ -1444,7 +1444,7 @@ async def whatsthescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 resp = await client.get(
                     "https://v3.football.api-sports.io/fixtures",
                     headers={"x-apisports-key": FOOTBALL_API_KEY},
-                    params={"date": date_str, "status": "1H,HT,2H,ET,BT,P"},
+                    params={"date": date_str, "status": "1H-HT-2H-ET-BT-P"},
                 )
                 if resp.status_code != 200:
                     continue
@@ -1468,7 +1468,7 @@ async def whatsthescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
 
         if not fixture:
-            blocks.append(f"{flag(match['team1'])} v {flag(match['team2'])} — no live data yet")
+            blocks.append(f"{flag(match['team1'])} v {flag(match['team2'])} — no live data yet (API returned {len(live_lookup)} live fixture(s))")
             continue
 
         goals = fixture["goals"]
