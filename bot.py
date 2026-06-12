@@ -1114,7 +1114,7 @@ def _compute_streak(uid: int, preds_by_user: dict, match_map: dict) -> int:
 
 
 async def _broadcast_match_result(bot, match, sh, sa):
-    """DM every predictor with result, points, streak, and group stats. Also posts to group chat."""
+    """DM every predictor with result, points, streak, rank delta, then send group summary."""
     from collections import Counter, defaultdict
 
     preds = db.table("predictions").select("*").eq("match_id", match["id"]).execute().data
@@ -1131,7 +1131,7 @@ async def _broadcast_match_result(bot, match, sh, sa):
         f" · Most picked: {top_pick[0]}–{top_pick[1]} ({top_count})"
     )
 
-    # Batch-load all predictions + match results for streak computation
+    # Streak data
     all_predictor_ids = [p["telegram_id"] for p in preds]
     all_preds = db.table("predictions").select("*").in_("telegram_id", all_predictor_ids).execute().data
     all_match_ids = list({p["match_id"] for p in all_preds})
@@ -1141,8 +1141,44 @@ async def _broadcast_match_result(bot, match, sh, sa):
     for p in all_preds:
         preds_by_user[p["telegram_id"]].append(p)
 
+    # Rank computation: global scores before and after this match
+    rank_users = db.table("users").select("telegram_id, name, winner_pick, golden_boot_pick, golden_ball_pick").execute().data
+    rank_all_preds = db.table("predictions").select("*").execute().data
+    rank_all_matches = db.table("matches").select("id, home_score, away_score, round").execute().data
+    rank_match_map = {m["id"]: m for m in rank_all_matches}
+    rank_user_map = {u["telegram_id"]: u for u in rank_users}
+    rank_preds_by_user = defaultdict(list)
+    for p in rank_all_preds:
+        rank_preds_by_user[p["telegram_id"]].append(p)
+
+    def compute_total(uid):
+        s = 0
+        for p in rank_preds_by_user[uid]:
+            m = rank_match_map.get(p["match_id"])
+            if not m or m.get("home_score") is None:
+                continue
+            s += calc_points(p["pred_home"], p["pred_away"], m["home_score"], m["away_score"]) * round_multiplier(m.get("round", ""))
+        u = rank_user_map.get(uid, {})
+        if TOURNAMENT_WINNER and u.get("winner_pick") == TOURNAMENT_WINNER: s += 10
+        if GOLDEN_BOOT_WINNER and (u.get("golden_boot_pick") or "").lower() == GOLDEN_BOOT_WINNER.lower(): s += 5
+        if GOLDEN_BALL_WINNER and (u.get("golden_ball_pick") or "").lower() == GOLDEN_BALL_WINNER.lower(): s += 5
+        return s
+
+    all_uids = [u["telegram_id"] for u in rank_users]
+    scores_after = {uid: compute_total(uid) for uid in all_uids}
+    pred_pts_map = {p["telegram_id"]: calc_points(p["pred_home"], p["pred_away"], sh, sa) * mult for p in preds}
+    scores_before = {uid: scores_after[uid] - pred_pts_map.get(uid, 0) for uid in all_uids}
+    sorted_after = sorted(scores_after.values(), reverse=True)
+    sorted_before = sorted(scores_before.values(), reverse=True)
+    n_players = len(all_uids)
+
+    def get_rank(score, sorted_scores):
+        return next((i + 1 for i, s in enumerate(sorted_scores) if s <= score), n_players)
+
+    name_map = {u["telegram_id"]: u.get("name") or "Anonymous" for u in rank_users}
+
     for p in preds:
-        pts = calc_points(p["pred_home"], p["pred_away"], sh, sa) * mult
+        pts = pred_pts_map[p["telegram_id"]]
         if pts >= 3:
             verdict = f"✅ Exact score! *+{pts} pts*"
         elif pts > 0:
@@ -1153,39 +1189,43 @@ async def _broadcast_match_result(bot, match, sh, sa):
         streak = _compute_streak(p["telegram_id"], preds_by_user, streak_match_map)
         streak_line = f"\n🔥 {streak} correct in a row!" if streak >= 3 else (f"\n🔥 {streak} in a row!" if streak == 2 else "")
 
+        uid = p["telegram_id"]
+        r_after = get_rank(scores_after.get(uid, 0), sorted_after)
+        r_before = get_rank(scores_before.get(uid, 0), sorted_before)
+        delta = r_before - r_after
+        if delta > 0:
+            rank_line = f"\n📈 Up {delta} to #{r_after} of {n_players}"
+        elif delta < 0:
+            rank_line = f"\n📉 Down {abs(delta)} to #{r_after} of {n_players}"
+        else:
+            rank_line = f"\n— #{r_after} of {n_players}"
+
         try:
             await bot.send_message(
-                chat_id=p["telegram_id"],
+                chat_id=uid,
                 text=(
                     f"⚽ Full time!\n"
                     f"{flag(match['team1'])} {sh}–{sa} {flag(match['team2'])}\n\n"
                     f"Your prediction: {p['pred_home']}–{p['pred_away']}\n"
                     f"{verdict}"
                     f"{streak_line}"
+                    f"{rank_line}"
                     f"{stats_line}"
                 ),
                 parse_mode="Markdown",
             )
         except Exception as e:
-            logging.warning(f"Broadcast failed for {p['telegram_id']}: {e}")
+            logging.warning(f"Broadcast failed for {uid}: {e}")
 
-    # Build group summary and send to all predictors
-    user_rows = db.table("users").select("telegram_id, name").in_("telegram_id", all_predictor_ids).execute().data
-    name_map = {u["telegram_id"]: u.get("name") or "Anonymous" for u in user_rows}
-
+    # Group summary — sorted by points desc
     summary_rows = []
     for p in preds:
-        pts = calc_points(p["pred_home"], p["pred_away"], sh, sa) * mult
+        pts = pred_pts_map[p["telegram_id"]]
         name = name_map.get(p["telegram_id"], "Anonymous")
-        if pts >= 3:
-            tag = f"✅ +{pts}pts"
-        elif pts > 0:
-            tag = f"👍 +{pts}pt"
-        else:
-            tag = "❌"
+        tag = f"✅ +{pts}pts" if pts >= 3 else (f"👍 +{pts}pt" if pts > 0 else "❌")
         summary_rows.append((-pts, name, p["pred_home"], p["pred_away"], tag))
-
     summary_rows.sort()
+
     summary_lines = [f"*{flag(match['team1'])} {sh}–{sa} {flag(match['team2'])}*\n"]
     for _, name, ph, pa, tag in summary_rows:
         summary_lines.append(f"{name}: {ph}–{pa}  {tag}")
@@ -1197,6 +1237,97 @@ async def _broadcast_match_result(bot, match, sh, sa):
         except Exception as e:
             logging.warning(f"Summary broadcast failed for {p['telegram_id']}: {e}")
 
+
+
+_recap_sent: set = set()
+
+async def send_match_day_recap(context: ContextTypes.DEFAULT_TYPE):
+    from collections import defaultdict
+    from datetime import timedelta
+    sgt = timezone(timedelta(hours=8))
+    now_sgt = datetime.now(timezone.utc).astimezone(sgt)
+
+    if now_sgt.hour != 23:
+        return
+
+    today_key = now_sgt.strftime("%Y-%m-%d")
+    if today_key in _recap_sent:
+        return
+
+    day_start = now_sgt.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    day_end = now_sgt.replace(hour=23, minute=59, second=59, microsecond=0).astimezone(timezone.utc)
+
+    finished = (
+        db.table("matches").select("*")
+        .eq("status", "finished")
+        .gte("kickoff_utc", day_start.isoformat())
+        .lte("kickoff_utc", day_end.isoformat())
+        .order("kickoff_utc")
+        .execute().data
+    )
+    if not finished:
+        return
+
+    _recap_sent.add(today_key)
+
+    match_ids = [m["id"] for m in finished]
+    day_preds = db.table("predictions").select("*").in_("match_id", match_ids).execute().data
+    all_users = db.table("users").select("telegram_id, name, winner_pick, golden_boot_pick, golden_ball_pick").execute().data
+    name_map = {u["telegram_id"]: u.get("name") or "Anonymous" for u in all_users}
+
+    preds_by_match = defaultdict(list)
+    for p in day_preds:
+        preds_by_match[p["match_id"]].append(p)
+
+    lines = [f"*Matchday recap — {now_sgt.strftime('%d %b')}*\n"]
+    for m in finished:
+        sh, sa = m["home_score"], m["away_score"]
+        mult = round_multiplier(m.get("round", ""))
+        lines.append(f"{flag(m['team1'])} {sh}–{sa} {flag(m['team2'])}")
+        rows = []
+        for p in preds_by_match.get(m["id"], []):
+            pts = calc_points(p["pred_home"], p["pred_away"], sh, sa) * mult
+            name = name_map.get(p["telegram_id"], "Anonymous")
+            icon = "✅" if pts >= 3 else ("👍" if pts > 0 else "❌")
+            rows.append((0 if pts >= 3 else (1 if pts > 0 else 2), f"  {name}: {p['pred_home']}-{p['pred_away']} {icon}"))
+        rows.sort()
+        lines.extend(r for _, r in rows)
+        lines.append("")
+
+    # Top 5 standings
+    all_preds_all = db.table("predictions").select("*").execute().data
+    all_matches_all = db.table("matches").select("id, home_score, away_score, round").execute().data
+    amm = {m["id"]: m for m in all_matches_all}
+    apbu = defaultdict(list)
+    for p in all_preds_all:
+        apbu[p["telegram_id"]].append(p)
+
+    user_scores = []
+    for u in all_users:
+        uid = u["telegram_id"]
+        pts = sum(
+            calc_points(p["pred_home"], p["pred_away"], amm[p["match_id"]]["home_score"], amm[p["match_id"]]["away_score"]) * round_multiplier(amm[p["match_id"]].get("round", ""))
+            for p in apbu[uid]
+            if p["match_id"] in amm and amm[p["match_id"]].get("home_score") is not None
+        )
+        if TOURNAMENT_WINNER and u.get("winner_pick") == TOURNAMENT_WINNER: pts += 10
+        if GOLDEN_BOOT_WINNER and (u.get("golden_boot_pick") or "").lower() == GOLDEN_BOOT_WINNER.lower(): pts += 5
+        if GOLDEN_BALL_WINNER and (u.get("golden_ball_pick") or "").lower() == GOLDEN_BALL_WINNER.lower(): pts += 5
+        user_scores.append((pts, u.get("name") or "Anonymous"))
+    user_scores.sort(reverse=True)
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines.append("*Standings*")
+    for i, (pts, name) in enumerate(user_scores[:5]):
+        icon = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{icon} {name} — {pts} pts")
+
+    recap_text = "\n".join(lines)
+    for u in all_users:
+        try:
+            await context.bot.send_message(chat_id=u["telegram_id"], text=recap_text, parse_mode="Markdown")
+        except Exception as e:
+            logging.warning(f"Recap failed for {u['telegram_id']}: {e}")
 
 
 async def _espn_finished_lookup(kickoff_utc_list: list) -> dict:
@@ -1774,6 +1905,7 @@ def main():
     app.job_queue.run_repeating(check_reminders, interval=60, first=10)
     app.job_queue.run_repeating(send_daily_digest, interval=3600, first=20)
     app.job_queue.run_repeating(poll_results, interval=120, first=30)
+    app.job_queue.run_repeating(send_match_day_recap, interval=3600, first=60)
     app.add_handler(CommandHandler("digest", digest))
     app.add_handler(CommandHandler("fixtures", fixtures))
     app.add_handler(CallbackQueryHandler(fixtures_cb, pattern=r"^fixtures:\d+$"))
