@@ -1431,27 +1431,30 @@ async def whatsthescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No matches currently in progress.")
         return
 
+    # Fetch by the kickoff dates of in-progress matches (live=all doesn't reliably include WC)
+    kickoff_dates = set()
+    for m in in_progress:
+        if m.get("kickoff_utc"):
+            kickoff_dates.add(datetime.fromisoformat(m["kickoff_utc"]).strftime("%Y-%m-%d"))
+
+    live_lookup = {}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                "https://v3.football.api-sports.io/fixtures",
-                headers={"x-apisports-key": FOOTBALL_API_KEY},
-                params={"live": "all"},
-            )
-        if resp.status_code != 200:
-            await update.message.reply_text("Couldn't fetch live scores right now.")
-            return
-        live_fixtures = resp.json().get("response", [])
+            for date_str in kickoff_dates:
+                resp = await client.get(
+                    "https://v3.football.api-sports.io/fixtures",
+                    headers={"x-apisports-key": FOOTBALL_API_KEY},
+                    params={"date": date_str, "status": "1H,HT,2H,ET,BT,P"},
+                )
+                if resp.status_code != 200:
+                    continue
+                for f in resp.json().get("response", []):
+                    h = f["teams"]["home"]["name"].lower()
+                    a = f["teams"]["away"]["name"].lower()
+                    live_lookup[(h, a)] = f
     except Exception as e:
         await update.message.reply_text(f"API error: {e}")
         return
-
-    # Build lookup by lowercased team names
-    live_lookup = {}
-    for f in live_fixtures:
-        h = f["teams"]["home"]["name"].lower()
-        a = f["teams"]["away"]["name"].lower()
-        live_lookup[(h, a)] = f
 
     blocks = []
     for match in in_progress:
