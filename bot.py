@@ -1444,7 +1444,7 @@ async def whatsthescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 resp = await client.get(
                     "https://v3.football.api-sports.io/fixtures",
                     headers={"x-apisports-key": FOOTBALL_API_KEY},
-                    params={"date": date_str, "status": "1H-HT-2H-ET-BT-P"},
+                    params={"date": date_str},
                 )
                 if resp.status_code != 200:
                     continue
