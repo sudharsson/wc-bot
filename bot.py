@@ -1263,10 +1263,13 @@ async def syncresults(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"API returned {resp.status_code}:\n{resp.text[:300]}")
         return
 
-    api_fixtures = resp.json().get("response", [])
+    body = resp.json()
+    errors = body.get("errors", {})
+    api_fixtures = body.get("response", [])
     if not api_fixtures:
         await update.message.reply_text(
-            f"API returned 0 finished fixtures for {today}.\n\n"
+            f"API returned 0 finished fixtures for {today}.\n"
+            f"Errors: {errors or 'none'}\n\n"
             f"DB pending: {', '.join(f['team1'] + ' v ' + f['team2'] for f in pending)}"
         )
         return
