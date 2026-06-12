@@ -1473,7 +1473,8 @@ async def whatsthescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
 
         if not found:
-            blocks.append(f"{flag(match['team1'])} v {flag(match['team2'])} — no data (ESPN returned {len(live_lookup)} fixture(s) for this date)")
+            espn_names = ", ".join(f"{h} v {a}" for h, a in live_lookup.keys())
+            blocks.append(f"{flag(match['team1'])} v {flag(match['team2'])} — no match\nDB: {t1} v {t2}\nESPN: {espn_names}")
             continue
 
         event, comp, home, away = found
