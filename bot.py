@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import random
 import string
@@ -90,6 +91,11 @@ FLAGS = {
     "Tahiti": "🇵🇫", "New Caledonia": "🇳🇨",
 }
 
+_MD_SPECIAL = re.compile(r'([_*\[\]()~`>#+\-=|{}.!\\])')
+
+def _escape_md(text: str) -> str:
+    return _MD_SPECIAL.sub(r'\\\1', str(text))
+
 def flag(name: str) -> str:
     """Return 'emoji name' if a flag is known, else just 'name'."""
     return f"{FLAGS[name]} {name}" if name in FLAGS else name
@@ -138,11 +144,11 @@ def _build_leaderboard_text(title: str, user_ids=None) -> str:
         rows.append((pts, len(by_user[uid]), u.get("name") or "Anonymous", winner_bonus + boot_bonus + ball_bonus))
     rows.sort(key=lambda x: (-x[0], -x[1]))
     medals = ["🥇", "🥈", "🥉"]
-    lines = [f"🏆 *{title}*\n"]
+    lines = [f"🏆 *{_escape_md(title)}*\n"]
     for i, (pts, cnt, name, bonus_pts) in enumerate(rows[:15]):
         rank = medals[i] if i < 3 else f"{i + 1}\\."
         bonus = " ⭐" if bonus_pts > 0 else ""
-        lines.append(f"{rank} {name}{bonus}  —  {pts} pts  _({cnt} predictions)_")
+        lines.append(f"{rank} {_escape_md(name)}{bonus}  —  {pts} pts  _\\({cnt} predictions\\)_")
     notes = []
     if TOURNAMENT_WINNER:
         notes.append(f"🏆 \\+10 winner")
@@ -1221,6 +1227,82 @@ async def poll_results(context: ContextTypes.DEFAULT_TYPE):
             await _broadcast_match_result(context.bot, match, sh, sa)
 
 
+async def syncresults(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    if not FOOTBALL_API_KEY:
+        await update.message.reply_text("No FOOTBALL_API_KEY set in environment.")
+        return
+
+    await update.message.reply_text("Fetching results from API...")
+
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(minutes=85)).isoformat()
+    pending = db.table("matches").select("*").eq("status", "scheduled").lt("kickoff_utc", cutoff).execute().data
+
+    if not pending:
+        await update.message.reply_text("No pending matches found in DB (kicked off 85+ min ago).")
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://v3.football.api-sports.io/fixtures",
+                headers={"x-apisports-key": FOOTBALL_API_KEY},
+                params={"league": 1, "season": 2026, "status": "FT"},
+            )
+    except Exception as e:
+        await update.message.reply_text(f"API request failed: {e}")
+        return
+
+    if resp.status_code != 200:
+        await update.message.reply_text(f"API returned {resp.status_code}:\n{resp.text[:300]}")
+        return
+
+    api_fixtures = resp.json().get("response", [])
+    if not api_fixtures:
+        await update.message.reply_text(
+            f"API returned 0 finished fixtures for league=1 season=2026.\n\n"
+            f"DB has these pending: {', '.join(f['''team1'''] + ' v ' + f['''team2'''] for f in pending)}"
+        )
+        return
+
+    api_lookup = {}
+    for f in api_fixtures:
+        home = f["teams"]["home"]["name"].lower()
+        away = f["teams"]["away"]["name"].lower()
+        goals = f["goals"]
+        if goals["home"] is not None and goals["away"] is not None:
+            api_lookup[(home, away)] = (int(goals["home"]), int(goals["away"]))
+
+    lines = [f"API has {len(api_lookup)} finished match(es). DB has {len(pending)} pending.\n"]
+    updated = 0
+    for match in pending:
+        t1 = (match["team1"] or "").lower()
+        t2 = (match["team2"] or "").lower()
+        result = api_lookup.get((t1, t2))
+        if not result:
+            for (ah, aa), scores in api_lookup.items():
+                if (t1 in ah or ah in t1) and (t2 in aa or aa in t2):
+                    result = scores
+                    break
+        if result:
+            sh, sa = result
+            db.table("matches").update({"score_home": sh, "score_away": sa, "status": "finished"}).eq("id", match["id"]).execute()
+            await _broadcast_match_result(context.bot, match, sh, sa)
+            lines.append(f"✅ {match['team1']} {sh}-{sa} {match['team2']} — updated + broadcast sent")
+            updated += 1
+        else:
+            api_names = ", ".join(f"{h} v {a}" for h, a in list(api_lookup.keys())[:5])
+            lines.append(f"❌ No match for {match['team1']} v {match['team2']}\n   API has: {api_names}")
+
+    lines.append(f"\n{updated}/{len(pending)} updated.")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def setresult(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Admin only.")
@@ -1546,6 +1628,7 @@ def main():
     app.add_handler(CommandHandler("goldenboot", goldenboot))
     app.add_handler(CommandHandler("goldenball", goldenball))
     app.add_handler(CommandHandler("setresult", setresult))
+    app.add_handler(CommandHandler("syncresults", syncresults))
     app.add_handler(CommandHandler("next", next_matches))
     app.add_handler(CommandHandler("whopicked", whopicked))
     print("Bot running. Press Ctrl+C to stop.")
