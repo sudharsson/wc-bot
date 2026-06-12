@@ -1390,6 +1390,98 @@ async def setresult(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _broadcast_match_result(context.bot, found, final_sh, final_sa)
 
 
+async def whatsthescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from datetime import timedelta
+    if _is_rate_limited(update.effective_user.id):
+        await update.message.reply_text("Slow down! Wait a moment.")
+        return
+    if not FOOTBALL_API_KEY:
+        await update.message.reply_text("Live scores not available.")
+        return
+
+    now = datetime.now(timezone.utc)
+    window_start = (now - timedelta(minutes=130)).isoformat()
+
+    # Matches that kicked off in the last ~2h and aren't finished yet
+    in_progress = (
+        db.table("matches").select("*")
+        .eq("status", "scheduled")
+        .lt("kickoff_utc", now.isoformat())
+        .gt("kickoff_utc", window_start)
+        .execute().data
+    )
+    if not in_progress:
+        await update.message.reply_text("No matches currently in progress.")
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://v3.football.api-sports.io/fixtures",
+                headers={"x-apisports-key": FOOTBALL_API_KEY},
+                params={"live": "all"},
+            )
+        if resp.status_code != 200:
+            await update.message.reply_text("Couldn't fetch live scores right now.")
+            return
+        live_fixtures = resp.json().get("response", [])
+    except Exception as e:
+        await update.message.reply_text(f"API error: {e}")
+        return
+
+    # Build lookup by lowercased team names
+    live_lookup = {}
+    for f in live_fixtures:
+        h = f["teams"]["home"]["name"].lower()
+        a = f["teams"]["away"]["name"].lower()
+        live_lookup[(h, a)] = f
+
+    blocks = []
+    for match in in_progress:
+        t1 = (match["team1"] or "").lower()
+        t2 = (match["team2"] or "").lower()
+        fixture = live_lookup.get((t1, t2))
+        if not fixture:
+            for (ah, aa), f in live_lookup.items():
+                if (t1 in ah or ah in t1) and (t2 in aa or aa in t2):
+                    fixture = f
+                    break
+
+        if not fixture:
+            blocks.append(f"{flag(match['team1'])} v {flag(match['team2'])} — no live data yet")
+            continue
+
+        goals = fixture["goals"]
+        status = fixture["fixture"]["status"]
+        elapsed = status.get("elapsed") or "?"
+        status_label = status.get("long", "")
+
+        lines = [
+            f"{flag(match['team1'])}  {goals['home']} – {goals['away']}  {flag(match['team2'])}",
+            f"{elapsed}' · {status_label}",
+        ]
+
+        events = fixture.get("events", [])
+        for e in events:
+            team = e["team"]["name"]
+            player = (e.get("player") or {}).get("name") or "?"
+            minute = e["time"]["elapsed"]
+            e_type = e.get("type", "")
+            detail = e.get("detail", "")
+            assist = (e.get("assist") or {}).get("name")
+
+            if e_type == "Goal":
+                assist_str = f" (assist: {assist})" if assist else ""
+                lines.append(f"  ⚽ {minute}' {player}{assist_str} — {team}")
+            elif e_type == "Card":
+                icon = "🟥" if "Red" in detail else "🟨"
+                lines.append(f"  {icon} {minute}' {player} — {team}")
+
+        blocks.append("\n".join(lines))
+
+    await update.message.reply_text("\n\n".join(blocks) if blocks else "No live data found.")
+
+
 async def next_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from datetime import datetime, timezone, timedelta
     sgt = timezone(timedelta(hours=8))
@@ -1613,6 +1705,7 @@ async def set_commands(app):
         BotCommand("whopicked",         "See everyone's pick for a match"),
         BotCommand("fixtures",          "Full fixture list"),
         BotCommand("mypredictions",     "Review or cancel your picks"),
+        BotCommand("score",             "Live score, goals & cards for current matches"),
         BotCommand("remind",            "Set kickoff reminders"),
         BotCommand("digest",            "Daily match digest"),
         BotCommand("start",             "Welcome & setup"),
@@ -1663,6 +1756,7 @@ def main():
     app.add_handler(CommandHandler("goldenball", goldenball))
     app.add_handler(CommandHandler("setresult", setresult))
     app.add_handler(CommandHandler("syncresults", syncresults))
+    app.add_handler(CommandHandler("score", whatsthescore))
     app.add_handler(CommandHandler("next", next_matches))
     app.add_handler(CommandHandler("whopicked", whopicked))
     print("Bot running. Press Ctrl+C to stop.")
