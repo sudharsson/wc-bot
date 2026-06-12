@@ -123,16 +123,16 @@ def _build_leaderboard_text(title: str, user_ids=None) -> str:
     if not users:
         return "No players yet\\."
     preds = db.table("predictions").select("*").execute().data
-    matches = db.table("matches").select("id, score_home, score_away, round").execute().data
+    matches = db.table("matches").select("id, home_score, away_score, round").execute().data
     match_map = {m["id"]: m for m in matches}
     by_user = defaultdict(list)
     for p in preds:
         by_user[p["telegram_id"]].append(p)
     def score_for(p):
         m = match_map.get(p["match_id"])
-        if not m or m.get("score_home") is None:
+        if not m or m.get("home_score") is None:
             return 0
-        return calc_points(p["pred_home"], p["pred_away"], m["score_home"], m["score_away"]) * round_multiplier(m.get("round", ""))
+        return calc_points(p["pred_home"], p["pred_away"], m["home_score"], m["away_score"]) * round_multiplier(m.get("round", ""))
     rows = []
     for u in users:
         uid = u["telegram_id"]
@@ -162,8 +162,8 @@ def _build_leaderboard_text(title: str, user_ids=None) -> str:
         lines.append("\n_Points will appear once match results are in\\._")
     return "\n".join(lines)
 
-def calc_points(pred_home, pred_away, score_home, score_away) -> int:
-    ph, pa, sh, sa = pred_home, pred_away, score_home, score_away
+def calc_points(pred_home, pred_away, home_score, away_score) -> int:
+    ph, pa, sh, sa = pred_home, pred_away, home_score, away_score
     if ph == sh and pa == sa:
         return 3
     if (ph > pa) == (sh > sa) and ph != pa:
@@ -741,7 +741,7 @@ async def _predictions_message(telegram_id):
         lines.append("\n*Played:*")
         for ko, p, m in played:
             ko_str = ko.astimezone(sgt).strftime("%a %d %b")
-            sh, sa = m.get("score_home"), m.get("score_away")
+            sh, sa = m.get("home_score"), m.get("away_score")
             if sh is not None and sa is not None:
                 pts = calc_points(p["pred_home"], p["pred_away"], sh, sa) * round_multiplier(m.get("round", ""))
                 result = f"{sh}–{sa}, +{pts}pts"
@@ -846,7 +846,7 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     match_ids = [p["match_id"] for p in preds]
-    matches = db.table("matches").select("id, score_home, score_away, round").in_("id", match_ids).execute().data
+    matches = db.table("matches").select("id, home_score, away_score, round").in_("id", match_ids).execute().data
     match_map = {m["id"]: m for m in matches}
 
     total_pts = 0
@@ -858,10 +858,10 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for p in preds:
         m = match_map.get(p["match_id"])
-        if not m or m.get("score_home") is None:
+        if not m or m.get("home_score") is None:
             pending += 1
             continue
-        pts = calc_points(p["pred_home"], p["pred_away"], m["score_home"], m["score_away"]) * round_multiplier(m.get("round", ""))
+        pts = calc_points(p["pred_home"], p["pred_away"], m["home_score"], m["away_score"]) * round_multiplier(m.get("round", ""))
         total_pts += pts
         if pts >= 3:
             exact += 1
@@ -883,7 +883,7 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Compute rank across all players
     all_users = db.table("users").select("telegram_id, winner_pick, golden_boot_pick, golden_ball_pick").execute().data
     all_preds = db.table("predictions").select("*").execute().data
-    all_matches_data = db.table("matches").select("id, score_home, score_away, round").execute().data
+    all_matches_data = db.table("matches").select("id, home_score, away_score, round").execute().data
     all_match_map = {m["id"]: m for m in all_matches_data}
     preds_by_user = defaultdict(list)
     for p in all_preds:
@@ -892,11 +892,11 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def user_total(u):
         s = sum(
             calc_points(p["pred_home"], p["pred_away"],
-                        all_match_map[p["match_id"]]["score_home"],
-                        all_match_map[p["match_id"]]["score_away"]) *
+                        all_match_map[p["match_id"]]["home_score"],
+                        all_match_map[p["match_id"]]["away_score"]) *
             round_multiplier(all_match_map[p["match_id"]].get("round", ""))
             for p in preds_by_user[u["telegram_id"]]
-            if p["match_id"] in all_match_map and all_match_map[p["match_id"]].get("score_home") is not None
+            if p["match_id"] in all_match_map and all_match_map[p["match_id"]].get("home_score") is not None
         )
         if TOURNAMENT_WINNER and u.get("winner_pick") == TOURNAMENT_WINNER:
             s += 10
@@ -1082,9 +1082,9 @@ def _compute_streak(uid: int, preds_by_user: dict, match_map: dict) -> int:
     results = []
     for p in preds_by_user[uid]:
         m = match_map.get(p["match_id"])
-        if not m or m.get("score_home") is None:
+        if not m or m.get("home_score") is None:
             continue
-        pts = calc_points(p["pred_home"], p["pred_away"], m["score_home"], m["score_away"])
+        pts = calc_points(p["pred_home"], p["pred_away"], m["home_score"], m["away_score"])
         results.append((m.get("kickoff_utc", ""), pts > 0))
     results.sort(key=lambda x: x[0])
     streak = 0
@@ -1118,7 +1118,7 @@ async def _broadcast_match_result(bot, match, sh, sa):
     all_predictor_ids = [p["telegram_id"] for p in preds]
     all_preds = db.table("predictions").select("*").in_("telegram_id", all_predictor_ids).execute().data
     all_match_ids = list({p["match_id"] for p in all_preds})
-    streak_matches = db.table("matches").select("id, kickoff_utc, score_home, score_away").in_("id", all_match_ids).execute().data
+    streak_matches = db.table("matches").select("id, kickoff_utc, home_score, away_score").in_("id", all_match_ids).execute().data
     streak_match_map = {m["id"]: m for m in streak_matches}
     preds_by_user = defaultdict(list)
     for p in all_preds:
@@ -1222,8 +1222,8 @@ async def poll_results(context: ContextTypes.DEFAULT_TYPE):
         if result:
             sh, sa = result
             db.table("matches").update({
-                "score_home": sh,
-                "score_away": sa,
+                "home_score": sh,
+                "away_score": sa,
                 "status": "finished",
             }).eq("id", match["id"]).execute()
             logging.info(f"Result saved: {match['team1']} {sh}-{sa} {match['team2']}")
@@ -1318,7 +1318,7 @@ async def syncresults(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sh, sa = result
             await update.message.reply_text(f"Found: {match['team1']} {sh}-{sa} {match['team2']} — saving...")
             try:
-                db.table("matches").update({"score_home": sh, "score_away": sa, "status": "finished"}).eq("id", match["id"]).execute()
+                db.table("matches").update({"home_score": sh, "away_score": sa, "status": "finished"}).eq("id", match["id"]).execute()
                 lines.append(f"✅ {match['team1']} {sh}-{sa} {match['team2']} — DB updated")
                 updated += 1
             except Exception as e:
@@ -1376,8 +1376,8 @@ async def setresult(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     already_finished = found.get("status") == "finished"
     db.table("matches").update({
-        "score_home": final_sh,
-        "score_away": final_sa,
+        "home_score": final_sh,
+        "away_score": final_sa,
         "status": "finished",
     }).eq("id", found["id"]).execute()
 
@@ -1469,7 +1469,7 @@ async def whopicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = db.table("users").select("telegram_id, name").execute().data
     user_names = {u["telegram_id"]: u.get("name") or "Anonymous" for u in users}
 
-    sh, sa = found.get("score_home"), found.get("score_away")
+    sh, sa = found.get("home_score"), found.get("away_score")
     lines = [f"🔮 *{flag(found['team1'])} v {flag(found['team2'])}*\n"]
     for p in sorted(preds, key=lambda x: (x["pred_home"], x["pred_away"])):
         name = user_names.get(p["telegram_id"], "Anonymous")
