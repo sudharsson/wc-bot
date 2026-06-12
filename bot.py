@@ -1255,40 +1255,48 @@ async def syncresults(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kickoff_dates = set()
     for match in pending:
         if match.get("kickoff_utc"):
-            kickoff_dates.add(datetime.fromisoformat(match["kickoff_utc"]).strftime("%Y-%m-%d"))
+            try:
+                kickoff_dates.add(datetime.fromisoformat(match["kickoff_utc"]).strftime("%Y-%m-%d"))
+            except Exception:
+                kickoff_dates.add(match["kickoff_utc"][:10])
+
+    await update.message.reply_text(f"Checking dates: {', '.join(kickoff_dates) or 'none found'}")
+
+    if not kickoff_dates:
+        await update.message.reply_text("No kickoff dates found — check kickoff_utc values in DB.")
+        return
 
     api_lookup = {}
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            for date_str in kickoff_dates:
+    for date_str in kickoff_dates:
+        try:
+            await update.message.reply_text(f"Fetching {date_str}...")
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
                 resp = await client.get(
                     "https://v3.football.api-sports.io/fixtures",
                     headers={"x-apisports-key": FOOTBALL_API_KEY},
                     params={"date": date_str, "status": "FT"},
                 )
-                if resp.status_code != 200:
-                    await update.message.reply_text(f"API returned {resp.status_code} for {date_str}:\n{resp.text[:200]}")
-                    return
-                body = resp.json()
-                errors = body.get("errors", {})
-                if errors:
-                    await update.message.reply_text(f"API error for {date_str}: {errors}")
-                    return
-                for f in body.get("response", []):
-                    home = f["teams"]["home"]["name"].lower()
-                    away = f["teams"]["away"]["name"].lower()
-                    goals = f["goals"]
-                    if goals["home"] is not None and goals["away"] is not None:
-                        api_lookup[(home, away)] = (int(goals["home"]), int(goals["away"]))
-    except Exception as e:
-        await update.message.reply_text(f"API request failed: {e}")
-        return
+            if resp.status_code != 200:
+                await update.message.reply_text(f"API returned {resp.status_code} for {date_str}:\n{resp.text[:200]}")
+                continue
+            body = resp.json()
+            errors = body.get("errors", {})
+            if errors:
+                await update.message.reply_text(f"API error for {date_str}: {errors}")
+                continue
+            fixtures = body.get("response", [])
+            await update.message.reply_text(f"Got {len(fixtures)} finished fixture(s) for {date_str}")
+            for f in fixtures:
+                home = f["teams"]["home"]["name"].lower()
+                away = f["teams"]["away"]["name"].lower()
+                goals = f["goals"]
+                if goals["home"] is not None and goals["away"] is not None:
+                    api_lookup[(home, away)] = (int(goals["home"]), int(goals["away"]))
+        except Exception as e:
+            await update.message.reply_text(f"Error fetching {date_str}: {e}")
 
     if not api_lookup:
-        await update.message.reply_text(
-            f"API returned 0 finished fixtures for dates: {', '.join(kickoff_dates)}\n"
-            f"DB pending: {', '.join(m['team1'] + ' v ' + m['team2'] for m in pending)}"
-        )
+        await update.message.reply_text("No finished fixtures found across all dates.")
         return
 
     lines = [f"API has {len(api_lookup)} finished match(es). DB has {len(pending)} pending.\n"]
