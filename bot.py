@@ -1380,9 +1380,7 @@ async def whatsthescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _is_rate_limited(update.effective_user.id):
         await update.message.reply_text("Slow down! Wait a moment.")
         return
-    if not FOOTBALL_API_KEY:
-        await update.message.reply_text("Live scores not available.")
-        return
+
 
     now = datetime.now(timezone.utc)
     window_start = (now - timedelta(minutes=130)).isoformat()
@@ -1446,8 +1444,7 @@ async def whatsthescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
 
         if not found:
-            espn_names = ", ".join(f"{h} v {a}" for h, a in live_lookup.keys())
-            blocks.append(f"{flag(match['team1'])} v {flag(match['team2'])} — no match\nDB: {t1} v {t2}\nESPN: {espn_names}")
+            blocks.append(f"{flag(match['team1'])} v {flag(match['team2'])} — no live data available")
             continue
 
         event, comp, home, away = found
