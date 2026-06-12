@@ -1437,25 +1437,27 @@ async def whatsthescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if m.get("kickoff_utc"):
             kickoff_dates.add(datetime.fromisoformat(m["kickoff_utc"]).strftime("%Y%m%d"))
 
+    ESPN_LEAGUES = ["fifa.world", "international.friendlies", "concacaf.nations.league", "uefa.nations"]
     live_lookup = {}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=15) as client:
             for date_str in kickoff_dates:
-                resp = await client.get(
-                    "http://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard",
-                    params={"dates": date_str},
-                )
-                if resp.status_code != 200:
-                    continue
-                for event in resp.json().get("events", []):
-                    comp = (event.get("competitions") or [{}])[0]
-                    competitors = comp.get("competitors", [])
-                    home = next((c for c in competitors if c.get("homeAway") == "home"), None)
-                    away = next((c for c in competitors if c.get("homeAway") == "away"), None)
-                    if home and away:
-                        h_name = home["team"]["displayName"].lower()
-                        a_name = away["team"]["displayName"].lower()
-                        live_lookup[(h_name, a_name)] = (event, comp, home, away)
+                for league_slug in ESPN_LEAGUES:
+                    resp = await client.get(
+                        f"http://site.api.espn.com/apis/site/v2/sports/soccer/{league_slug}/scoreboard",
+                        params={"dates": date_str},
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    for event in resp.json().get("events", []):
+                        comp = (event.get("competitions") or [{}])[0]
+                        competitors = comp.get("competitors", [])
+                        home = next((c for c in competitors if c.get("homeAway") == "home"), None)
+                        away = next((c for c in competitors if c.get("homeAway") == "away"), None)
+                        if home and away:
+                            h_name = home["team"]["displayName"].lower()
+                            a_name = away["team"]["displayName"].lower()
+                            live_lookup[(h_name, a_name)] = (event, comp, home, away)
     except Exception as e:
         await update.message.reply_text(f"Error fetching scores: {e}")
         return
