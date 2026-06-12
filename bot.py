@@ -1431,71 +1431,92 @@ async def whatsthescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No matches currently in progress.")
         return
 
-    # Fetch by the kickoff dates of in-progress matches (live=all doesn't reliably include WC)
+    # Collect unique kickoff dates (ESPN uses YYYYMMDD format)
     kickoff_dates = set()
     for m in in_progress:
         if m.get("kickoff_utc"):
-            kickoff_dates.add(datetime.fromisoformat(m["kickoff_utc"]).strftime("%Y-%m-%d"))
+            kickoff_dates.add(datetime.fromisoformat(m["kickoff_utc"]).strftime("%Y%m%d"))
 
     live_lookup = {}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             for date_str in kickoff_dates:
                 resp = await client.get(
-                    "https://v3.football.api-sports.io/fixtures",
-                    headers={"x-apisports-key": FOOTBALL_API_KEY},
-                    params={"date": date_str},
+                    "http://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard",
+                    params={"dates": date_str},
                 )
                 if resp.status_code != 200:
                     continue
-                for f in resp.json().get("response", []):
-                    h = f["teams"]["home"]["name"].lower()
-                    a = f["teams"]["away"]["name"].lower()
-                    live_lookup[(h, a)] = f
+                for event in resp.json().get("events", []):
+                    comp = (event.get("competitions") or [{}])[0]
+                    competitors = comp.get("competitors", [])
+                    home = next((c for c in competitors if c.get("homeAway") == "home"), None)
+                    away = next((c for c in competitors if c.get("homeAway") == "away"), None)
+                    if home and away:
+                        h_name = home["team"]["displayName"].lower()
+                        a_name = away["team"]["displayName"].lower()
+                        live_lookup[(h_name, a_name)] = (event, comp, home, away)
     except Exception as e:
-        await update.message.reply_text(f"API error: {e}")
+        await update.message.reply_text(f"Error fetching scores: {e}")
         return
 
     blocks = []
     for match in in_progress:
         t1 = (match["team1"] or "").lower()
         t2 = (match["team2"] or "").lower()
-        fixture = live_lookup.get((t1, t2))
-        if not fixture:
-            for (ah, aa), f in live_lookup.items():
+
+        found = live_lookup.get((t1, t2))
+        if not found:
+            for (ah, aa), data in live_lookup.items():
                 if _team_names_match(t1, ah) and _team_names_match(t2, aa):
-                    fixture = f
+                    found = data
                     break
 
-        if not fixture:
-            blocks.append(f"{flag(match['team1'])} v {flag(match['team2'])} — no live data yet (API returned {len(live_lookup)} live fixture(s))")
+        if not found:
+            blocks.append(f"{flag(match['team1'])} v {flag(match['team2'])} — no data (ESPN returned {len(live_lookup)} fixture(s) for this date)")
             continue
 
-        goals = fixture["goals"]
-        status = fixture["fixture"]["status"]
-        elapsed = status.get("elapsed") or "?"
-        status_label = status.get("long", "")
+        event, comp, home, away = found
+        h_score = home.get("score", "?")
+        a_score = away.get("score", "?")
+        status = event.get("status", {})
+        status_name = status.get("type", {}).get("name", "")
+        clock = status.get("displayClock", "?")
+        period = status.get("period", 1)
+
+        if "HALFTIME" in status_name:
+            time_str = "Half Time"
+        elif "FULL_TIME" in status_name or "FINAL" in status_name:
+            time_str = "Full Time"
+        else:
+            time_str = f"{clock} · {'1st Half' if period == 1 else '2nd Half'}"
 
         lines = [
-            f"{flag(match['team1'])}  {goals['home']} – {goals['away']}  {flag(match['team2'])}",
-            f"{elapsed}' · {status_label}",
+            f"{flag(match['team1'])}  {h_score} – {a_score}  {flag(match['team2'])}",
+            time_str,
         ]
 
-        events = fixture.get("events", [])
-        for e in events:
-            team = e["team"]["name"]
-            player = (e.get("player") or {}).get("name") or "?"
-            minute = e["time"]["elapsed"]
-            e_type = e.get("type", "")
-            detail = e.get("detail", "")
-            assist = (e.get("assist") or {}).get("name")
+        home_id = home["team"].get("id", "")
+        for d in comp.get("details", []):
+            d_type = (d.get("type") or {}).get("text", "")
+            minute = (d.get("clock") or {}).get("displayValue", "?")
+            athletes = d.get("athletesInvolved", [])
+            player = athletes[0].get("displayName", "?") if athletes else "?"
+            team_id = (d.get("team") or {}).get("id", "")
+            team_name = home["team"]["displayName"] if team_id == home_id else away["team"]["displayName"]
 
-            if e_type == "Goal":
+            if d.get("ownGoal"):
+                lines.append(f"  ⚽ {minute}' {player} (OG) — {team_name}")
+            elif d_type == "Goal" or d.get("scoreValue"):
+                assist = athletes[1].get("displayName") if len(athletes) > 1 else None
                 assist_str = f" (assist: {assist})" if assist else ""
-                lines.append(f"  ⚽ {minute}' {player}{assist_str} — {team}")
-            elif e_type == "Card":
-                icon = "🟥" if "Red" in detail else "🟨"
-                lines.append(f"  {icon} {minute}' {player} — {team}")
+                lines.append(f"  ⚽ {minute}' {player}{assist_str} — {team_name}")
+            elif d.get("yellowRedCard"):
+                lines.append(f"  🟨🟥 {minute}' {player} — {team_name}")
+            elif d.get("redCard"):
+                lines.append(f"  🟥 {minute}' {player} — {team_name}")
+            elif d.get("yellowCard"):
+                lines.append(f"  🟨 {minute}' {player} — {team_name}")
 
         blocks.append("\n".join(lines))
 
