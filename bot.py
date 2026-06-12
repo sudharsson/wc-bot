@@ -1525,56 +1525,52 @@ async def next_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def whopicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from datetime import datetime, timezone, timedelta
-    args = context.args
+    sgt = timezone(timedelta(hours=8))
+    now = datetime.now(timezone.utc)
 
-    if len(args) < 2:
-        await update.message.reply_text("Usage: /whopicked Brazil Morocco")
+    # Show all matches that have already kicked off
+    all_matches = db.table("matches").select("*").order("kickoff_utc", desc=True).execute().data
+    started = [m for m in all_matches if m.get("kickoff_utc") and datetime.fromisoformat(m["kickoff_utc"]) <= now]
+
+    if not started:
+        await update.message.reply_text("No matches have kicked off yet.")
         return
-    if any(len(a) > 50 for a in args):
-        await update.message.reply_text("Team name too long. Check spelling and try again.")
-        return
 
-    # Parse team names (ignore any score token if present)
-    score_idx = next((i for i, a in enumerate(args) if "-" in a and any(c.isdigit() for c in a)), None)
-    if score_idx is not None:
-        team1_text = " ".join(args[:score_idx]).strip()
-        team2_text = " ".join(args[score_idx + 1:]).strip()
-    else:
-        team1_text = args[0]
-        team2_text = " ".join(args[1:])
+    buttons = []
+    for m in started[:20]:
+        ko = datetime.fromisoformat(m["kickoff_utc"]).astimezone(sgt)
+        status = "FT" if m.get("status") == "finished" else "Live"
+        label = f"{flag(m['team1'])} v {flag(m['team2'])}  ·  {ko.strftime('%d %b')}  [{status}]"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"whopicked:{m['id']}")])
 
-    matches = db.table("matches").select("*").execute().data
-    t1, t2 = team1_text.lower(), team2_text.lower()
-    found = None
-    for m in matches:
-        mt1, mt2 = (m["team1"] or "").lower(), (m["team2"] or "").lower()
-        if (t1 in mt1 and t2 in mt2) or (t1 in mt2 and t2 in mt1):
-            found = m
-            break
+    await update.message.reply_text(
+        "Pick a match to see everyone's predictions:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
+
+async def whopicked_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from datetime import datetime, timezone
+    query = update.callback_query
+    await query.answer()
+    match_id = query.data.split(":", 1)[1]
+
+    found = db.table("matches").select("*").eq("id", match_id).execute().data
     if not found:
-        await update.message.reply_text(f"No match found for {team1_text} v {team2_text}.")
+        await query.edit_message_text("Match not found.")
         return
+    found = found[0]
 
-    kickoff = datetime.fromisoformat(found["kickoff_utc"])
-    if datetime.now(timezone.utc) < kickoff:
-        sgt = timezone(timedelta(hours=8))
-        ko_sgt = kickoff.astimezone(sgt).strftime("%a %d %b %H:%M")
-        await update.message.reply_text(
-            f"Picks for {flag(found['team1'])} v {flag(found['team2'])} are hidden until kickoff ({ko_sgt} SGT)."
-        )
-        return
-
-    preds = db.table("predictions").select("*").eq("match_id", found["id"]).execute().data
+    preds = db.table("predictions").select("*").eq("match_id", match_id).execute().data
     if not preds:
-        await update.message.reply_text(f"Nobody predicted {flag(found['team1'])} v {flag(found['team2'])}.")
+        await query.edit_message_text(f"Nobody predicted {flag(found['team1'])} v {flag(found['team2'])}.")
         return
 
     users = db.table("users").select("telegram_id, name").execute().data
     user_names = {u["telegram_id"]: u.get("name") or "Anonymous" for u in users}
 
     sh, sa = found.get("home_score"), found.get("away_score")
-    lines = [f"🔮 *{flag(found['team1'])} v {flag(found['team2'])}*\n"]
+    lines = [f"*{flag(found['team1'])} v {flag(found['team2'])}*\n"]
     for p in sorted(preds, key=lambda x: (x["pred_home"], x["pred_away"])):
         name = user_names.get(p["telegram_id"], "Anonymous")
         score_str = f"{p['pred_home']}–{p['pred_away']}"
@@ -1582,10 +1578,10 @@ async def whopicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pts = calc_points(p["pred_home"], p["pred_away"], sh, sa) * round_multiplier(found.get("round", ""))
             pts_tag = f"  ✅ +{pts}pts" if pts > 0 else "  ❌"
         else:
-            pts_tag = ""
+            pts_tag = "  ⏳"
         lines.append(f"{name}: {score_str}{pts_tag}")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def createleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1771,6 +1767,7 @@ def main():
     app.add_handler(CommandHandler("score", whatsthescore))
     app.add_handler(CommandHandler("next", next_matches))
     app.add_handler(CommandHandler("whopicked", whopicked))
+    app.add_handler(CallbackQueryHandler(whopicked_cb, pattern=r"^whopicked:.+$"))
     print("Bot running. Press Ctrl+C to stop.")
     app.run_polling()
 
