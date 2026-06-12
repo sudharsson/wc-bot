@@ -1171,11 +1171,51 @@ async def _broadcast_match_result(bot, match, sh, sa):
 
 
 
-async def poll_results(context: ContextTypes.DEFAULT_TYPE):
-    """Fetch finished WC match results from api-football and update Supabase."""
-    if not FOOTBALL_API_KEY:
-        return
+async def _espn_finished_lookup(kickoff_utc_list: list) -> dict:
+    """Fetch finished match results from ESPN for the given kickoff times. Returns {(home, away): (h_score, a_score)}."""
+    from datetime import timedelta
+    dates = set()
+    for ko_str in kickoff_utc_list:
+        ko = datetime.fromisoformat(ko_str)
+        dates.add(ko.strftime("%Y%m%d"))
+        dates.add((ko - timedelta(hours=5)).strftime("%Y%m%d"))  # EST fallback
 
+    lookup = {}
+    ESPN_LEAGUES = ["fifa.world", "international.friendlies", "concacaf.nations.league", "uefa.nations"]
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            for date_str in dates:
+                for slug in ESPN_LEAGUES:
+                    resp = await client.get(
+                        f"http://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard",
+                        params={"dates": date_str},
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    for event in resp.json().get("events", []):
+                        status = event.get("status", {})
+                        if not status.get("type", {}).get("completed"):
+                            continue
+                        comp = (event.get("competitions") or [{}])[0]
+                        competitors = comp.get("competitors", [])
+                        home = next((c for c in competitors if c.get("homeAway") == "home"), None)
+                        away = next((c for c in competitors if c.get("homeAway") == "away"), None)
+                        if home and away:
+                            try:
+                                h_score = int(home.get("score", 0))
+                                a_score = int(away.get("score", 0))
+                                h_name = home["team"]["displayName"].lower()
+                                a_name = away["team"]["displayName"].lower()
+                                lookup[(h_name, a_name)] = (h_score, a_score)
+                            except (ValueError, KeyError):
+                                pass
+    except Exception as e:
+        logging.warning(f"ESPN fetch failed: {e}")
+    return lookup
+
+
+async def poll_results(context: ContextTypes.DEFAULT_TYPE):
+    """Fetch finished WC match results from ESPN and update Supabase."""
     from datetime import timedelta
     now = datetime.now(timezone.utc)
     cutoff = (now - timedelta(minutes=105)).isoformat()
@@ -1191,44 +1231,17 @@ async def poll_results(context: ContextTypes.DEFAULT_TYPE):
     if not pending:
         return
 
-    # Fetch for each unique kickoff date across pending matches (avoids date boundary issues)
-    kickoff_dates = set()
-    for match in pending:
-        if match.get("kickoff_utc"):
-            kickoff_dates.add(datetime.fromisoformat(match["kickoff_utc"]).strftime("%Y-%m-%d"))
-    if not kickoff_dates:
+    ko_list = [m["kickoff_utc"] for m in pending if m.get("kickoff_utc")]
+    if not ko_list:
         return
 
-    api_lookup = {}
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            for date_str in kickoff_dates:
-                resp = await client.get(
-                    "https://v3.football.api-sports.io/fixtures",
-                    headers={"x-apisports-key": FOOTBALL_API_KEY},
-                    params={"date": date_str, "status": "FT"},
-                )
-                if resp.status_code != 200:
-                    logging.warning(f"poll_results: API returned {resp.status_code} for {date_str}")
-                    continue
-                for f in resp.json().get("response", []):
-                    home = f["teams"]["home"]["name"].lower()
-                    away = f["teams"]["away"]["name"].lower()
-                    goals = f["goals"]
-                    if goals["home"] is not None and goals["away"] is not None:
-                        api_lookup[(home, away)] = (int(goals["home"]), int(goals["away"]))
-    except Exception as e:
-        logging.warning(f"poll_results request failed: {e}")
-        return
-
+    api_lookup = await _espn_finished_lookup(ko_list)
     if not api_lookup:
         return
 
     for match in pending:
         t1 = (match["team1"] or "").lower()
         t2 = (match["team2"] or "").lower()
-
-        # Exact match first, then partial (handles name differences like "Korea Republic" vs "South Korea")
         result = api_lookup.get((t1, t2))
         if not result:
             for (ah, aa), scores in api_lookup.items():
@@ -1244,8 +1257,6 @@ async def poll_results(context: ContextTypes.DEFAULT_TYPE):
                 "status": "finished",
             }).eq("id", match["id"]).execute()
             logging.info(f"Result saved: {match['team1']} {sh}-{sa} {match['team2']}")
-
-            # Broadcast result to everyone who predicted this match.
             await _broadcast_match_result(context.bot, match, sh, sa)
 
 
@@ -1254,11 +1265,7 @@ async def syncresults(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
 
-    if not FOOTBALL_API_KEY:
-        await update.message.reply_text("No FOOTBALL_API_KEY set in environment.")
-        return
-
-    await update.message.reply_text("Fetching results from API...")
+    await update.message.reply_text("Fetching results from ESPN...")
 
     from datetime import timedelta
     now = datetime.now(timezone.utc)
@@ -1269,48 +1276,9 @@ async def syncresults(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No pending matches found in DB (kicked off 85+ min ago).")
         return
 
-    kickoff_dates = set()
-    for match in pending:
-        if match.get("kickoff_utc"):
-            try:
-                kickoff_dates.add(datetime.fromisoformat(match["kickoff_utc"]).strftime("%Y-%m-%d"))
-            except Exception:
-                kickoff_dates.add(match["kickoff_utc"][:10])
-
-    await update.message.reply_text(f"Checking dates: {', '.join(kickoff_dates) or 'none found'}")
-
-    if not kickoff_dates:
-        await update.message.reply_text("No kickoff dates found — check kickoff_utc values in DB.")
-        return
-
-    api_lookup = {}
-    for date_str in kickoff_dates:
-        try:
-            await update.message.reply_text(f"Fetching {date_str}...")
-            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
-                resp = await client.get(
-                    "https://v3.football.api-sports.io/fixtures",
-                    headers={"x-apisports-key": FOOTBALL_API_KEY},
-                    params={"date": date_str, "status": "FT"},
-                )
-            if resp.status_code != 200:
-                await update.message.reply_text(f"API returned {resp.status_code} for {date_str}:\n{resp.text[:200]}")
-                continue
-            body = resp.json()
-            errors = body.get("errors", {})
-            if errors:
-                await update.message.reply_text(f"API error for {date_str}: {errors}")
-                continue
-            fixtures = body.get("response", [])
-            await update.message.reply_text(f"Got {len(fixtures)} finished fixture(s) for {date_str}")
-            for f in fixtures:
-                home = f["teams"]["home"]["name"].lower()
-                away = f["teams"]["away"]["name"].lower()
-                goals = f["goals"]
-                if goals["home"] is not None and goals["away"] is not None:
-                    api_lookup[(home, away)] = (int(goals["home"]), int(goals["away"]))
-        except Exception as e:
-            await update.message.reply_text(f"Error fetching {date_str}: {e}")
+    ko_list = [m["kickoff_utc"] for m in pending if m.get("kickoff_utc")]
+    api_lookup = await _espn_finished_lookup(ko_list)
+    await update.message.reply_text(f"ESPN returned {len(api_lookup)} finished match(es). DB has {len(pending)} pending.")
 
     if not api_lookup:
         await update.message.reply_text("No finished fixtures found across all dates.")
