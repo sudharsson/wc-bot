@@ -1179,7 +1179,7 @@ async def poll_results(context: ContextTypes.DEFAULT_TYPE):
             resp = await client.get(
                 "https://v3.football.api-sports.io/fixtures",
                 headers={"x-apisports-key": FOOTBALL_API_KEY},
-                params={"league": 1, "season": 2026, "status": "FT"},
+                params={"date": now.strftime("%Y-%m-%d"), "status": "FT"},
             )
     except Exception as e:
         logging.warning(f"poll_results request failed: {e}")
@@ -1247,12 +1247,13 @@ async def syncresults(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No pending matches found in DB (kicked off 85+ min ago).")
         return
 
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 "https://v3.football.api-sports.io/fixtures",
                 headers={"x-apisports-key": FOOTBALL_API_KEY},
-                params={"league": 1, "season": 2026, "status": "FT"},
+                params={"date": today, "status": "FT"},
             )
     except Exception as e:
         await update.message.reply_text(f"API request failed: {e}")
@@ -1265,8 +1266,8 @@ async def syncresults(update: Update, context: ContextTypes.DEFAULT_TYPE):
     api_fixtures = resp.json().get("response", [])
     if not api_fixtures:
         await update.message.reply_text(
-            f"API returned 0 finished fixtures for league=1 season=2026.\n\n"
-            f"DB has these pending: {', '.join(f['''team1'''] + ' v ' + f['''team2'''] for f in pending)}"
+            f"API returned 0 finished fixtures for {today}.\n\n"
+            f"DB pending: {', '.join(f['team1'] + ' v ' + f['team2'] for f in pending)}"
         )
         return
 
