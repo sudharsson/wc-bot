@@ -1431,11 +1431,14 @@ async def whatsthescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No matches currently in progress.")
         return
 
-    # Collect unique kickoff dates (ESPN uses YYYYMMDD format)
+    # Collect kickoff dates in both UTC and EST (ESPN groups by US Eastern time)
     kickoff_dates = set()
     for m in in_progress:
         if m.get("kickoff_utc"):
-            kickoff_dates.add(datetime.fromisoformat(m["kickoff_utc"]).strftime("%Y%m%d"))
+            from datetime import timedelta
+            ko = datetime.fromisoformat(m["kickoff_utc"])
+            kickoff_dates.add(ko.strftime("%Y%m%d"))
+            kickoff_dates.add((ko - timedelta(hours=5)).strftime("%Y%m%d"))  # EST fallback
 
     ESPN_LEAGUES = ["fifa.world", "international.friendlies", "concacaf.nations.league", "uefa.nations"]
     live_lookup = {}
