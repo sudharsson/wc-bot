@@ -1169,6 +1169,34 @@ async def _broadcast_match_result(bot, match, sh, sa):
         except Exception as e:
             logging.warning(f"Broadcast failed for {p['telegram_id']}: {e}")
 
+    # Build group summary and send to all predictors
+    user_rows = db.table("users").select("telegram_id, name").in_("telegram_id", all_predictor_ids).execute().data
+    name_map = {u["telegram_id"]: u.get("name") or "Anonymous" for u in user_rows}
+
+    summary_rows = []
+    for p in preds:
+        pts = calc_points(p["pred_home"], p["pred_away"], sh, sa) * mult
+        name = name_map.get(p["telegram_id"], "Anonymous")
+        if pts >= 3:
+            tag = f"✅ +{pts}pts"
+        elif pts > 0:
+            tag = f"👍 +{pts}pt"
+        else:
+            tag = "❌"
+        summary_rows.append((-pts, name, p["pred_home"], p["pred_away"], tag))
+
+    summary_rows.sort()
+    summary_lines = [f"*{flag(match['team1'])} {sh}–{sa} {flag(match['team2'])}*\n"]
+    for _, name, ph, pa, tag in summary_rows:
+        summary_lines.append(f"{name}: {ph}–{pa}  {tag}")
+    summary_text = "\n".join(summary_lines)
+
+    for p in preds:
+        try:
+            await bot.send_message(chat_id=p["telegram_id"], text=summary_text, parse_mode="Markdown")
+        except Exception as e:
+            logging.warning(f"Summary broadcast failed for {p['telegram_id']}: {e}")
+
 
 
 async def _espn_finished_lookup(kickoff_utc_list: list) -> dict:
