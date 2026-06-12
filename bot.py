@@ -1299,6 +1299,10 @@ async def syncresults(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No finished fixtures found across all dates.")
         return
 
+    sample = list(api_lookup.keys())[:5]
+    sample_str = "\n".join(f"  {h} v {a}" for h, a in sample)
+    await update.message.reply_text(f"API teams (sample):\n{sample_str}")
+
     lines = [f"API has {len(api_lookup)} finished match(es). DB has {len(pending)} pending.\n"]
     updated = 0
     for match in pending:
@@ -1312,10 +1316,19 @@ async def syncresults(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
         if result:
             sh, sa = result
-            db.table("matches").update({"score_home": sh, "score_away": sa, "status": "finished"}).eq("id", match["id"]).execute()
-            await _broadcast_match_result(context.bot, match, sh, sa)
-            lines.append(f"✅ {match['team1']} {sh}-{sa} {match['team2']} — updated + broadcast sent")
-            updated += 1
+            await update.message.reply_text(f"Found: {match['team1']} {sh}-{sa} {match['team2']} — saving...")
+            try:
+                db.table("matches").update({"score_home": sh, "score_away": sa, "status": "finished"}).eq("id", match["id"]).execute()
+                lines.append(f"✅ {match['team1']} {sh}-{sa} {match['team2']} — DB updated")
+                updated += 1
+            except Exception as e:
+                lines.append(f"⚠️ DB update failed for {match['team1']} v {match['team2']}: {e}")
+                continue
+            try:
+                await _broadcast_match_result(context.bot, match, sh, sa)
+                lines[-1] += " + broadcast sent"
+            except Exception as e:
+                lines.append(f"⚠️ Broadcast failed: {e}")
         else:
             api_names = ", ".join(f"{h} v {a}" for h, a in list(api_lookup.keys())[:5])
             lines.append(f"❌ No match for {match['team1']} v {match['team2']}\n   API has: {api_names}")
