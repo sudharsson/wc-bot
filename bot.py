@@ -1644,7 +1644,22 @@ async def whatsthescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         .execute().data
     )
     if not in_progress:
-        await update.message.reply_text("No matches currently in progress.")
+        recent = (
+            db.table("matches").select("*")
+            .eq("status", "finished")
+            .order("kickoff_utc", desc=True)
+            .limit(1)
+            .execute().data
+        )
+        if not recent:
+            await update.message.reply_text("No matches in progress and no results yet.")
+            return
+        m = recent[0]
+        sh, sa = m.get("home_score"), m.get("away_score")
+        await update.message.reply_text(
+            f"No live matches right now.\n\n"
+            f"Last result: {flag(m['team1'])} {sh}–{sa} {flag(m['team2'])} (FT)"
+        )
         return
 
     # Collect kickoff dates in both UTC and EST (ESPN groups by US Eastern time)
@@ -1960,14 +1975,45 @@ async def masterleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="MarkdownV2")
 
 
+def _resolve_user_arg(arg: str) -> int | None:
+    """Resolve a /kick or /unkick argument to a telegram_id. Accepts numeric ID or @username."""
+    if arg.isdigit():
+        return int(arg)
+    if arg.startswith("@"):
+        username = arg[1:]
+        row = db.table("users").select("telegram_id").ilike("username", username).execute().data
+        return row[0]["telegram_id"] if row else None
+    return None
+
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    users = db.table("users").select("telegram_id, name, username, joined_at, banned").order("joined_at").execute().data
+    if not users:
+        await update.message.reply_text("No users yet.")
+        return
+    lines = [f"*{len(users)} users*\n"]
+    for u in users:
+        handle = f"@{u['username']}" if u.get("username") else "no handle"
+        joined = (u.get("joined_at") or "")[:10] or "?"
+        banned_tag = " 🚫" if u.get("banned") else ""
+        lines.append(f"{_escape_md_v1(u.get('name') or '?')} ({handle}){banned_tag}\n`{u['telegram_id']}` — {joined}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Admin only.")
         return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: /kick <user_id>")
+    if not context.args:
+        await update.message.reply_text("Usage: /kick <user_id> or /kick @username")
         return
-    user_id = int(context.args[0])
+    user_id = _resolve_user_arg(context.args[0])
+    if not user_id:
+        await update.message.reply_text("User not found. Use their numeric ID or @username.")
+        return
     db.table("users").update({"banned": True}).eq("telegram_id", user_id).execute()
     _banned_users.add(user_id)
     await update.message.reply_text(f"User {user_id} kicked.")
@@ -1981,13 +2027,100 @@ async def unkick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Admin only.")
         return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: /unkick <user_id>")
+    if not context.args:
+        await update.message.reply_text("Usage: /unkick <user_id> or /unkick @username")
         return
-    user_id = int(context.args[0])
+    user_id = _resolve_user_arg(context.args[0])
+    if not user_id:
+        await update.message.reply_text("User not found.")
+        return
     db.table("users").update({"banned": False}).eq("telegram_id", user_id).execute()
     _banned_users.discard(user_id)
     await update.message.reply_text(f"User {user_id} restored.")
+
+
+async def addmatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a knockout match. Usage: /addmatch Brazil v Argentina 2026-07-05T21:00:00 Round of 32"""
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    text = " ".join(context.args)
+    # Extract ISO datetime — YYYY-MM-DDTHH:MM or YYYY-MM-DDTHH:MM:SS with optional Z
+    date_match = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z?)", text)
+    if not date_match:
+        await update.message.reply_text(
+            "Usage: /addmatch Brazil v Argentina 2026-07-05T21:00:00 Round of 32\n"
+            "Datetime must be in UTC, format: YYYY-MM-DDTHH:MM:SS"
+        )
+        return
+
+    dt_str = date_match.group(1).rstrip("Z")
+    kickoff_utc = datetime.fromisoformat(dt_str).replace(tzinfo=timezone.utc).isoformat()
+
+    before_date = text[:date_match.start()].strip()
+    round_name = text[date_match.end():].strip() or "knockout"
+
+    v_match = re.search(r"\bv\b", before_date, re.IGNORECASE)
+    if not v_match:
+        await update.message.reply_text("Couldn't find 'v' separator. Example: /addmatch Brazil v Argentina 2026-07-05T21:00:00")
+        return
+
+    team1 = before_date[:v_match.start()].strip()
+    team2 = before_date[v_match.end():].strip()
+    if not team1 or not team2:
+        await update.message.reply_text("Both team names are required.")
+        return
+
+    match_id = f"k{int(time.time())}"
+    db.table("matches").insert({
+        "id": match_id,
+        "team1": team1,
+        "team2": team2,
+        "kickoff_utc": kickoff_utc,
+        "status": "scheduled",
+        "round": round_name,
+    }).execute()
+
+    from datetime import timedelta
+    sgt = timezone(timedelta(hours=8))
+    ko_sgt = datetime.fromisoformat(kickoff_utc).astimezone(sgt).strftime("%d %b %H:%M")
+    await update.message.reply_text(
+        f"✅ Match added: {flag(team1)} v {flag(team2)}\n"
+        f"{ko_sgt} SGT · {round_name} · ID: `{match_id}`",
+        parse_mode="Markdown",
+    )
+
+
+async def setteams(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Update team names on an existing match. Usage: /setteams <match_id> Brazil v Argentina"""
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if not context.args or len(context.args) < 4:
+        await update.message.reply_text("Usage: /setteams <match_id> Brazil v Argentina")
+        return
+
+    match_id = context.args[0]
+    rest = " ".join(context.args[1:])
+    v_match = re.search(r"\bv\b", rest, re.IGNORECASE)
+    if not v_match:
+        await update.message.reply_text("Couldn't find 'v' separator.")
+        return
+
+    team1 = rest[:v_match.start()].strip()
+    team2 = rest[v_match.end():].strip()
+
+    row = db.table("matches").select("id").eq("id", match_id).execute().data
+    if not row:
+        await update.message.reply_text(f"No match found with ID `{match_id}`.", parse_mode="Markdown")
+        return
+
+    db.table("matches").update({"team1": team1, "team2": team2}).eq("id", match_id).execute()
+    await update.message.reply_text(
+        f"✅ Updated: {flag(team1)} v {flag(team2)} (ID: `{match_id}`)",
+        parse_mode="Markdown",
+    )
 
 
 async def set_commands(app):
@@ -2060,6 +2193,9 @@ def main():
     app.add_handler(CommandHandler("syncresults", syncresults))
     app.add_handler(CommandHandler("kick", kick_user))
     app.add_handler(CommandHandler("unkick", unkick_user))
+    app.add_handler(CommandHandler("users", list_users))
+    app.add_handler(CommandHandler("addmatch", addmatch))
+    app.add_handler(CommandHandler("setteams", setteams))
     app.add_handler(CommandHandler("score", whatsthescore))
     app.add_handler(CommandHandler("next", next_matches))
     app.add_handler(CommandHandler("whopicked", whopicked))
