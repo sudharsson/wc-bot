@@ -9,16 +9,20 @@ Run:
     python load_fixtures.py
 """
  
+import os
 import re
 import requests
 from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
 from supabase import create_client
- 
-SUPABASE_URL = "https://hamdfegumgskkhnvbgqn.supabase.co"
-SUPABASE_KEY = "sb_publishable_y8WYb03AszvXc_8dqbVy9A_dyA1_fVV"
- 
+
+load_dotenv()
+
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+
 DATA_URL = "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json"
- 
+
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
  
  
