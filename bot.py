@@ -44,6 +44,18 @@ def _is_rate_limited(user_id: int, seconds: float = 2.0) -> bool:
     _last_command[user_id] = now
     return False
 
+# Banned users: loaded from DB once, updated immediately on /kick or /unkick.
+_banned_users: set[int] = set()
+_banned_loaded = False
+
+def _is_banned(user_id: int) -> bool:
+    global _banned_loaded
+    if not _banned_loaded:
+        rows = db.table("users").select("telegram_id").eq("banned", True).execute().data
+        _banned_users.update(r["telegram_id"] for r in rows)
+        _banned_loaded = True
+    return user_id in _banned_users
+
 FLAGS = {
     # South America
     "Argentina": "🇦🇷", "Brazil": "🇧🇷", "Uruguay": "🇺🇾", "Colombia": "🇨🇴",
@@ -214,11 +226,30 @@ def calc_points(pred_home, pred_away, home_score, away_score) -> int:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+
+    if _is_banned(user.id):
+        await update.message.reply_text("This bot is private.")
+        return
+
+    is_new = not db.table("users").select("telegram_id").eq("telegram_id", user.id).execute().data
+
     db.table("users").upsert({
         "telegram_id": user.id,
         "name": user.first_name,
         "username": user.username,
     }).execute()
+
+    if is_new and ADMIN_ID:
+        handle = f"@{user.username}" if user.username else "no handle"
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"New user: {user.first_name} ({handle})\nID: `{user.id}`\n\n/kick {user.id} to remove them.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
     await update.message.reply_text(
         f"⚽ *Hey {user.first_name}! Welcome to the World Cup 2026 Prediction Game.*\n\n"
         "Predict the scoreline of every match, earn points, and beat your mates to the top of the leaderboard.\n\n"
@@ -392,6 +423,9 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if _is_rate_limited(user.id):
         await update.message.reply_text("Slow down! Wait a moment.")
+        return ConversationHandler.END
+    if _is_banned(user.id):
+        await update.message.reply_text("This bot is private.")
         return ConversationHandler.END
 
     args = context.args
@@ -995,6 +1029,9 @@ async def winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _is_rate_limited(user.id):
         await update.message.reply_text("⏳ Slow down! Wait a moment and try again.")
         return
+    if _is_banned(user.id):
+        await update.message.reply_text("This bot is private.")
+        return
     args = context.args
 
     if not args:
@@ -1044,6 +1081,9 @@ async def goldenboot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _is_rate_limited(user.id):
         await update.message.reply_text("⏳ Slow down! Wait a moment and try again.")
         return
+    if _is_banned(user.id):
+        await update.message.reply_text("This bot is private.")
+        return
     args = context.args
 
     if not args:
@@ -1086,6 +1126,9 @@ async def goldenball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if _is_rate_limited(user.id):
         await update.message.reply_text("⏳ Slow down! Wait a moment and try again.")
+        return
+    if _is_banned(user.id):
+        await update.message.reply_text("This bot is private.")
         return
     args = context.args
 
@@ -1775,6 +1818,9 @@ async def whopicked_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def createleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if _is_banned(user.id):
+        await update.message.reply_text("This bot is private.")
+        return
     if not context.args:
         await update.message.reply_text(
             "Give your league a name: `/createleague My Friends`",
@@ -1813,6 +1859,9 @@ async def createleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def joinleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if _is_banned(user.id):
+        await update.message.reply_text("This bot is private.")
+        return
     if not context.args:
         await update.message.reply_text("Usage: `/joinleague ABC123`", parse_mode="Markdown")
         return
@@ -1890,6 +1939,36 @@ async def masterleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="MarkdownV2")
 
 
+async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /kick <user_id>")
+        return
+    user_id = int(context.args[0])
+    db.table("users").update({"banned": True}).eq("telegram_id", user_id).execute()
+    _banned_users.add(user_id)
+    await update.message.reply_text(f"User {user_id} kicked.")
+    try:
+        await context.bot.send_message(chat_id=user_id, text="You've been removed from this prediction game.")
+    except Exception:
+        pass
+
+
+async def unkick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /unkick <user_id>")
+        return
+    user_id = int(context.args[0])
+    db.table("users").update({"banned": False}).eq("telegram_id", user_id).execute()
+    _banned_users.discard(user_id)
+    await update.message.reply_text(f"User {user_id} restored.")
+
+
 async def set_commands(app):
     await app.bot.set_my_commands([
         BotCommand("predict",           "Predict a match scoreline"),
@@ -1958,6 +2037,8 @@ def main():
     app.add_handler(CommandHandler("goldenball", goldenball))
     app.add_handler(CommandHandler("setresult", setresult))
     app.add_handler(CommandHandler("syncresults", syncresults))
+    app.add_handler(CommandHandler("kick", kick_user))
+    app.add_handler(CommandHandler("unkick", unkick_user))
     app.add_handler(CommandHandler("score", whatsthescore))
     app.add_handler(CommandHandler("next", next_matches))
     app.add_handler(CommandHandler("whopicked", whopicked))
