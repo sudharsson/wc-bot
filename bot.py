@@ -1990,7 +1990,11 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Admin only.")
         return
-    users = db.table("users").select("telegram_id, name, username, banned").order("telegram_id").execute().data
+    try:
+        users = db.table("users").select("telegram_id, name, username, banned").order("telegram_id").execute().data
+    except Exception as e:
+        await update.message.reply_text(f"DB error: {e}")
+        return
     if not users:
         await update.message.reply_text("No users yet.")
         return
@@ -2000,7 +2004,6 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         banned_tag = " 🚫" if u.get("banned") else ""
         lines.append(f"{_escape_md_v1(u.get('name') or '?')} ({handle}){banned_tag}\n`{u['telegram_id']}`")
     text = "\n".join(lines)
-    # Telegram message limit is 4096 chars — split if needed
     for i in range(0, len(text), 4000):
         await update.message.reply_text(text[i:i+4000], parse_mode="Markdown")
 
