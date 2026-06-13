@@ -130,6 +130,12 @@ def _team_names_match(db_name: str, api_name: str) -> bool:
 def _escape_md(text: str) -> str:
     return _MD_SPECIAL.sub(r'\\\1', str(text))
 
+_MD_V1_SPECIAL = re.compile(r'([*_`\[\]])')
+
+def _escape_md_v1(text: str) -> str:
+    """Escape Markdown v1 special chars in user-controlled strings."""
+    return _MD_V1_SPECIAL.sub(r'\\\1', str(text))
+
 def flag(name: str) -> str:
     """Return 'emoji name' if a flag is known, else just 'name'."""
     return f"{FLAGS[name]} {name}" if name in FLAGS else name
@@ -382,6 +388,10 @@ def _build_predict_keyboard(uid: int, page: int):
 
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if _is_rate_limited(user.id):
+        await update.message.reply_text("Slow down! Wait a moment.")
+        return ConversationHandler.END
+
     args = context.args
 
     # Text-based shortcut: /predict Brazil 2-1 Morocco still works
@@ -1245,7 +1255,7 @@ async def _broadcast_match_result(bot, match, sh, sa):
 
     summary_lines = [f"*{flag(match['team1'])} {sh}–{sa} {flag(match['team2'])}*\n"]
     for _, name, ph, pa, tag in summary_rows:
-        summary_lines.append(f"{name}: {ph}–{pa}  {tag}")
+        summary_lines.append(f"{_escape_md_v1(name)}: {ph}–{pa}  {tag}")
     summary_text = "\n".join(summary_lines)
 
     for p in preds:
@@ -1306,7 +1316,7 @@ async def send_match_day_recap(context: ContextTypes.DEFAULT_TYPE):
             pts = calc_points(p["pred_home"], p["pred_away"], sh, sa) * mult
             name = name_map.get(p["telegram_id"], "Anonymous")
             icon = "✅" if pts >= 3 else ("👍" if pts > 0 else "❌")
-            rows.append((0 if pts >= 3 else (1 if pts > 0 else 2), f"  {name}: {p['pred_home']}-{p['pred_away']} {icon}"))
+            rows.append((0 if pts >= 3 else (1 if pts > 0 else 2), f"  {_escape_md_v1(name)}: {p['pred_home']}-{p['pred_away']} {icon}"))
         rows.sort()
         lines.extend(r for _, r in rows)
         lines.append("")
@@ -1337,7 +1347,7 @@ async def send_match_day_recap(context: ContextTypes.DEFAULT_TYPE):
     lines.append("*Standings*")
     for i, (pts, name) in enumerate(user_scores[:5]):
         icon = medals[i] if i < 3 else f"{i + 1}."
-        lines.append(f"{icon} {name} — {pts} pts")
+        lines.append(f"{icon} {_escape_md_v1(name)} — {pts} pts")
 
     recap_text = "\n".join(lines)
     for u in all_users:
@@ -1755,7 +1765,7 @@ async def whopicked_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pts_tag = f"  ✅ +{pts}pts" if pts > 0 else "  ❌"
         else:
             pts_tag = "  ⏳"
-        lines.append(f"{name}: {score_str}{pts_tag}")
+        lines.append(f"{_escape_md_v1(name)}: {score_str}{pts_tag}")
 
     await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
 
@@ -1775,6 +1785,10 @@ async def createleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _is_rate_limited(user.id):
         await update.message.reply_text("⏳ Slow down! Wait a moment and try again.")
         return
+    existing_memberships = db.table("league_members").select("league_id").eq("telegram_id", user.id).execute().data
+    if len(existing_memberships) >= 5:
+        await update.message.reply_text("You're already in 5 leagues — leave one before creating another.")
+        return
     try:
         db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
         code = _generate_league_code()
@@ -1786,7 +1800,7 @@ async def createleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Couldn't create the league. Please try again later.")
         return
     await update.message.reply_text(
-        f"🏆 League *{name}* created!\n\n"
+        f"🏆 League *{_escape_md_v1(name)}* created!\n\n"
         f"Share this code with your friends:\n"
         f"`{code}`\n\n"
         f"They join with: `/joinleague {code}`",
@@ -1820,12 +1834,12 @@ async def joinleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
         .execute().data
     )
     if existing:
-        await update.message.reply_text(f"You're already in *{league['name']}*!", parse_mode="Markdown")
+        await update.message.reply_text(f"You're already in *{_escape_md_v1(league['name'])}*!", parse_mode="Markdown")
         return
     db.table("league_members").insert({"league_id": league["id"], "telegram_id": user.id}).execute()
     count = len(db.table("league_members").select("telegram_id").eq("league_id", league["id"]).execute().data)
     await update.message.reply_text(
-        f"✅ Joined *{league['name']}*! ({count} member{'s' if count != 1 else ''})\n\n"
+        f"✅ Joined *{_escape_md_v1(league['name'])}*! ({count} member{'s' if count != 1 else ''})\n\n"
         f"Use /leaderboard to see the standings.",
         parse_mode="Markdown",
     )
@@ -1859,8 +1873,8 @@ async def myleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for lg in leagues:
         member_ids = members_by_league[lg["id"]]
         count = len(member_ids)
-        names = ", ".join(user_name_map.get(mid, "Anonymous") for mid in member_ids)
-        lines.append(f"*{lg['name']}* — code: `{lg['code']}` ({count} member{'s' if count != 1 else ''})")
+        names = ", ".join(_escape_md_v1(user_name_map.get(mid, "Anonymous")) for mid in member_ids)
+        lines.append(f"*{_escape_md_v1(lg['name'])}* — code: `{lg['code']}` ({count} member{'s' if count != 1 else ''})")
         lines.append(f"_{names}_\n")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
