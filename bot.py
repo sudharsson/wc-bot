@@ -93,17 +93,34 @@ FLAGS = {
 
 _MD_SPECIAL = re.compile(r'([_*\[\]()~`>#+\-=|{}.!\\])')
 
+_TEAM_ALIASES: dict[str, str] = {
+    "usa": "united states",
+    "united states": "united states",
+    "uae": "united arab emirates",
+    "drc": "dr congo",
+    "dr congo": "dr congo",
+    "china pr": "china",
+    "korea republic": "south korea",
+    "czechia": "czech republic",
+    "north macedonia": "macedonia",
+    "türkiye": "turkey",
+    "turkiye": "turkey",
+}
+
+def _normalise_team(name: str) -> str:
+    n = name.lower().strip()
+    return _TEAM_ALIASES.get(n, n)
+
 def _team_names_match(db_name: str, api_name: str) -> bool:
-    """Return True if db_name and api_name refer to the same team.
-    Handles variants like 'South Korea' vs 'Korea Republic', 'Czech Republic' vs 'Czechia'."""
-    d, a = db_name.lower(), api_name.lower()
-    if d in a or a in d:
+    """Return True if db_name and api_name refer to the same team."""
+    d = _normalise_team(db_name)
+    a = _normalise_team(api_name)
+    if d == a or d in a or a in d:
         return True
     d_words = {w for w in d.split() if len(w) > 2}
     a_words = {w for w in a.split() if len(w) > 2}
     if d_words & a_words:
         return True
-    # Prefix match handles "czech" → "czechia", "korea" in both names
     for dw in d_words:
         for aw in a_words:
             if aw.startswith(dw) or dw.startswith(aw):
