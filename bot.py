@@ -1991,7 +1991,8 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
     try:
-        users = db.table("users").select("telegram_id, name, username, banned").order("telegram_id").execute().data
+        users = db.table("users").select("*").order("telegram_id").execute().data
+        await update.message.reply_text(f"Got {len(users)} users from DB.")
     except Exception as e:
         await update.message.reply_text(f"DB error: {e}")
         return
