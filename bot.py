@@ -217,6 +217,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.table("users").upsert({
         "telegram_id": user.id,
         "name": user.first_name,
+        "username": user.username,
     }).execute()
     await update.message.reply_text(
         f"⚽ *Hey {user.first_name}! Welcome to the World Cup 2026 Prediction Game.*\n\n"
@@ -266,7 +267,7 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choice = args[0].lower()
 
     if choice == "off":
-        db.table("users").upsert({"telegram_id": user.id, "remind_minutes": 0}).execute()
+        db.table("users").upsert({"telegram_id": user.id, "username": user.username, "remind_minutes": 0}).execute()
         await update.message.reply_text("🔕 Reminders off.")
         return
 
@@ -281,6 +282,7 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.table("users").upsert({
         "telegram_id": user.id,
         "name": user.first_name,
+        "username": user.username,
         "remind_minutes": minutes,
     }).execute()
     await update.message.reply_text(f"⏰ Got it — I'll ping you {minutes} min before kickoff.")
@@ -399,7 +401,7 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _predict_from_args(update, context)
         return ConversationHandler.END
 
-    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name, "username": user.username}).execute()
     text, keyboard = _build_predict_keyboard(user.id, 0)
     if not text:
         await update.message.reply_text("No upcoming matches to predict right now.")
@@ -473,7 +475,7 @@ async def predict_enter_score(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("That match has now started — predictions are closed.")
         return ConversationHandler.END
 
-    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name, "username": user.username}).execute()
     db.table("predictions").upsert({
         "telegram_id": user.id,
         "match_id": m["id"],
@@ -519,7 +521,7 @@ async def _predict_from_args(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("That score looks a bit off — max 20 goals per side.")
         return
 
-    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name, "username": user.username}).execute()
 
     matches = db.table("matches").select("*").eq("status", "scheduled").execute().data
     t1, t2 = team1_text.lower(), team2_text.lower()
@@ -575,7 +577,7 @@ async def digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choice = args[0].lower()
 
     if choice == "off":
-        db.table("users").upsert({"telegram_id": user.id, "digest_hour": None}).execute()
+        db.table("users").upsert({"telegram_id": user.id, "username": user.username, "digest_hour": None}).execute()
         await update.message.reply_text("🔕 Daily digest off.")
         return
 
@@ -587,6 +589,7 @@ async def digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.table("users").upsert({
         "telegram_id": user.id,
         "name": user.first_name,
+        "username": user.username,
         "digest_hour": hour,
     }).execute()
     # friendly 12h label
@@ -1028,7 +1031,7 @@ async def winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name, "winner_pick": matched}).execute()
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name, "username": user.username, "winner_pick": matched}).execute()
     await update.message.reply_text(
         f"🏆 Winner pick saved: {flag(matched)}\n\n"
         "_Correct pick = +10 bonus pts at the final!_",
@@ -1071,7 +1074,7 @@ async def goldenboot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(pick) > 50:
         await update.message.reply_text("That name is too long. Try again.")
         return
-    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name, "golden_boot_pick": pick}).execute()
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name, "username": user.username, "golden_boot_pick": pick}).execute()
     await update.message.reply_text(
         f"👟 Golden Boot pick saved: *{pick}*\n\n"
         "_Correct pick = +5 bonus pts!_",
@@ -1114,7 +1117,7 @@ async def goldenball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(pick) > 50:
         await update.message.reply_text("That name is too long. Try again.")
         return
-    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name, "golden_ball_pick": pick}).execute()
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name, "username": user.username, "golden_ball_pick": pick}).execute()
     await update.message.reply_text(
         f"🏅 Golden Ball pick saved: *{pick}*\n\n"
         "_Correct pick = +5 bonus pts!_",
@@ -1790,7 +1793,7 @@ async def createleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You're already in 5 leagues — leave one before creating another.")
         return
     try:
-        db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
+        db.table("users").upsert({"telegram_id": user.id, "name": user.first_name, "username": user.username}).execute()
         code = _generate_league_code()
         result = db.table("leagues").insert({"name": name, "code": code}).execute()
         league_id = result.data[0]["id"]
@@ -1825,7 +1828,7 @@ async def joinleague(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     league = row[0]
-    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name}).execute()
+    db.table("users").upsert({"telegram_id": user.id, "name": user.first_name, "username": user.username}).execute()
     existing = (
         db.table("league_members")
         .select("league_id")
