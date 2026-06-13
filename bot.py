@@ -1990,17 +1990,19 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Admin only.")
         return
-    users = db.table("users").select("telegram_id, name, username, joined_at, banned").order("joined_at").execute().data
+    users = db.table("users").select("telegram_id, name, username, banned").order("telegram_id").execute().data
     if not users:
         await update.message.reply_text("No users yet.")
         return
     lines = [f"*{len(users)} users*\n"]
     for u in users:
         handle = f"@{u['username']}" if u.get("username") else "no handle"
-        joined = (u.get("joined_at") or "")[:10] or "?"
         banned_tag = " 🚫" if u.get("banned") else ""
-        lines.append(f"{_escape_md_v1(u.get('name') or '?')} ({handle}){banned_tag}\n`{u['telegram_id']}` — {joined}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        lines.append(f"{_escape_md_v1(u.get('name') or '?')} ({handle}){banned_tag}\n`{u['telegram_id']}`")
+    text = "\n".join(lines)
+    # Telegram message limit is 4096 chars — split if needed
+    for i in range(0, len(text), 4000):
+        await update.message.reply_text(text[i:i+4000], parse_mode="Markdown")
 
 
 async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
