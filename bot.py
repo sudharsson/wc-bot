@@ -1992,7 +1992,6 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         users = db.table("users").select("*").order("telegram_id").execute().data
-        await update.message.reply_text(f"Got {len(users)} users from DB.")
     except Exception as e:
         await update.message.reply_text(f"DB error: {e}")
         return
@@ -2001,7 +2000,7 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = [f"*{len(users)} users*\n"]
     for u in users:
-        handle = f"@{u['username']}" if u.get("username") else "no handle"
+        handle = f"@{_escape_md_v1(u['username'])}" if u.get("username") else "no handle"
         banned_tag = " 🚫" if u.get("banned") else ""
         lines.append(f"{_escape_md_v1(u.get('name') or '?')} ({handle}){banned_tag}\n`{u['telegram_id']}`")
     text = "\n".join(lines)
