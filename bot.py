@@ -447,6 +447,9 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def predict_page_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if _is_rate_limited(query.from_user.id):
+        await query.answer("Slow down!")
+        return
     await query.answer()
     page = int(query.data.split(":")[1])
     text, keyboard = _build_predict_keyboard(query.from_user.id, page)
@@ -459,6 +462,9 @@ async def predict_page_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def predict_pick_match_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if _is_rate_limited(query.from_user.id):
+        await query.answer("Slow down!")
+        return
     await query.answer()
     match_id = query.data.split(":", 1)[1]
 
@@ -743,6 +749,9 @@ async def fixtures_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(timezone.utc)
 
     query = update.callback_query
+    if _is_rate_limited(query.from_user.id):
+        await query.answer("Slow down!")
+        return
     await query.answer()
     uid = query.from_user.id
     page = int(query.data.split(":")[1])
@@ -844,6 +853,9 @@ async def mypredictions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel_pred_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from datetime import datetime, timezone
     query = update.callback_query
+    if _is_rate_limited(query.from_user.id):
+        await query.answer("Slow down!")
+        return
     match_id = query.data.split(":", 1)[1]
     telegram_id = query.from_user.id
 
@@ -891,6 +903,9 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def leaderboard_global_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if _is_rate_limited(query.from_user.id):
+        await query.answer("Slow down!")
+        return
     await query.answer()
     text = _build_leaderboard_text("Master Leaderboard")
     await query.edit_message_text(text, parse_mode="MarkdownV2")
@@ -898,6 +913,9 @@ async def leaderboard_global_cb(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def leaderboard_league_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if _is_rate_limited(query.from_user.id):
+        await query.answer("Slow down!")
+        return
     await query.answer()
     league_id = int(query.data.split(":")[-1])
     league = db.table("leagues").select("*").eq("id", league_id).execute().data
@@ -1419,7 +1437,7 @@ async def _espn_finished_lookup(kickoff_utc_list: list) -> dict:
             for date_str in dates:
                 for slug in ESPN_LEAGUES:
                     resp = await client.get(
-                        f"http://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard",
+                        f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard",
                         params={"dates": date_str},
                     )
                     if resp.status_code != 200:
@@ -1645,7 +1663,7 @@ async def whatsthescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for date_str in kickoff_dates:
                 for league_slug in ESPN_LEAGUES:
                     resp = await client.get(
-                        f"http://site.api.espn.com/apis/site/v2/sports/soccer/{league_slug}/scoreboard",
+                        f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_slug}/scoreboard",
                         params={"dates": date_str},
                     )
                     if resp.status_code != 200:
@@ -1784,6 +1802,9 @@ async def whopicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def whopicked_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from datetime import datetime, timezone
     query = update.callback_query
+    if _is_rate_limited(query.from_user.id):
+        await query.answer("Slow down!")
+        return
     await query.answer()
     match_id = query.data.split(":", 1)[1]
 
