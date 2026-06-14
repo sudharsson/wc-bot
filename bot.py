@@ -218,9 +218,9 @@ def calc_points(pred_home, pred_away, home_score, away_score) -> int:
     ph, pa, sh, sa = pred_home, pred_away, home_score, away_score
     if ph == sh and pa == sa:
         return 3
-    if (ph > pa) == (sh > sa) and ph != pa:
-        return 1
-    if ph == pa and sh == sa:  # predicted draw, actual draw, wrong score
+    def _outcome(h, a):
+        return "home" if h > a else ("away" if a > h else "draw")
+    if _outcome(ph, pa) == _outcome(sh, sa):
         return 1
     return 0
 
