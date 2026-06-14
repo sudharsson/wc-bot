@@ -1042,6 +1042,54 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if _is_rate_limited(uid):
+        await update.message.reply_text("⏳ Slow down! Wait a moment and try again.")
+        return
+
+    preds = db.table("predictions").select("match_id, pred_home, pred_away").eq("telegram_id", uid).execute().data
+    if not preds:
+        await update.message.reply_text("No predictions yet — use /predict to get started!")
+        return
+
+    match_ids = [p["match_id"] for p in preds]
+    matches = db.table("matches").select("id, team1, team2, home_score, away_score, kickoff_utc, round").in_("id", match_ids).execute().data
+    match_map = {m["id"]: m for m in matches}
+
+    from datetime import timedelta
+    sgt = timezone(timedelta(hours=8))
+
+    rows = []
+    for p in preds:
+        m = match_map.get(p["match_id"])
+        if not m or m.get("home_score") is None:
+            continue
+        sh, sa = m["home_score"], m["away_score"]
+        pts = calc_points(p["pred_home"], p["pred_away"], sh, sa) * round_multiplier(m.get("round", ""))
+        ko = datetime.fromisoformat(m["kickoff_utc"]).astimezone(sgt) if m.get("kickoff_utc") else None
+        rows.append((ko, m, p, sh, sa, pts))
+
+    if not rows:
+        await update.message.reply_text("No finished matches with your predictions yet.")
+        return
+
+    rows.sort(key=lambda x: x[0] or datetime.min.replace(tzinfo=sgt))
+
+    lines = ["*Your prediction history:*\n"]
+    for ko, m, p, sh, sa, pts in rows:
+        date_str = ko.strftime("%d %b") if ko else "?"
+        icon = "✅" if pts >= 3 else ("👍" if pts > 0 else "❌")
+        lines.append(
+            f"{icon} {flag(m['team1'])} {sh}–{sa} {flag(m['team2'])}  _{date_str}_\n"
+            f"   Your pick: {p['pred_home']}–{p['pred_away']} · +{pts}pts"
+        )
+
+    text = "\n".join(lines)
+    for i in range(0, len(text), 4000):
+        await update.message.reply_text(text[i:i+4000], parse_mode="Markdown")
+
+
 async def winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if _is_rate_limited(user.id):
@@ -2191,6 +2239,7 @@ def main():
     app.add_handler(CommandHandler("joinleague", joinleague))
     app.add_handler(CommandHandler("myleague", myleague))
     app.add_handler(CommandHandler("mypoints", mypoints))
+    app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("winner", winner))
     app.add_handler(CommandHandler("goldenboot", goldenboot))
     app.add_handler(CommandHandler("goldenball", goldenball))
